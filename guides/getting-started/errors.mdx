@@ -1,0 +1,81 @@
+---
+title: "Errors & codes"
+description: "Every non-2xx response uses the same envelope. Handle by error.code, never by HTTP status alone or by parsing message."
+---
+
+<Note>**The rule** — Branch on **`error.code`**. Codes are stable across versions; HTTP statuses are reused (403 covers both "wrong scope" and "wrong scheme"); `message` is human-readable and may change wording without notice.</Note>
+
+## Error envelope
+
+```json
+{
+  "error": {
+    "code": "PRACTITIONER_NOT_LICENSED_AT_FACILITY",
+    "message": "Practitioner RMDC-12345 is not licensed at facility MF00632",
+    "details": [
+      { "field": "practitionerLicenseNumber", "value": "RMDC-12345" },
+      { "field": "fosaId", "value": "MF00632" }
+    ]
+  }
+}
+```
+
+## Auth & scope
+
+| HTTP | code | When |
+| --- | --- | --- |
+| 401 | `INVALID_CREDENTIALS` | `/session` got an unknown `serviceName` or wrong secret. |
+| 401 | `TOKEN_EXPIRED` | JWT `exp` passed. *Refresh and retry.* |
+| 401 | `TOKEN_INVALID` | Signature failure or malformed bearer. |
+| 403 | `SCHEME_NOT_ALLOWED` | Request `scheme` outside token's `allowedSchemes`. |
+| 403 | `FACILITY_NOT_IN_SCOPE` | `fosaId` not in token's `allowedFosaIds`. |
+| 403 | `PHARMACY_NOT_ALLOWED` | `allowPharmacy:false` hit a `/pharmacy/*` endpoint. |
+
+## Lookup
+
+| HTTP | code | When |
+| --- | --- | --- |
+| 404 | `FACILITY_NOT_FOUND` | No facility matches any provided key. |
+| 404 | `PRACTITIONER_NOT_FOUND` | No practitioner matches license / NID / passport / phone. |
+| 404 | `PRODUCT_NOT_FOUND` | Unknown `productCode` / `alternateCode` / ATC. |
+| 400 | `INVALID_DIAGNOSIS_CODE` | Not a recognised ICD-11 / ICD-10 code. |
+
+## Clinical & billing
+
+| HTTP | code | When |
+| --- | --- | --- |
+| 409 | `PRACTITIONER_NOT_LICENSED_AT_FACILITY` | Practitioner has no active licence at posted `fosaId`. |
+| 409 | `MEMBER_NOT_ELIGIBLE` | CBHI household contributions lapsed. |
+| 409 | `BENEFICIARY_NOT_ELIGIBLE` | RAMA card inactive. |
+| 409 | `VOUCHER_EXPIRED` | Voucher `expiresAt` passed before dispense. |
+| 409 | `VOUCHER_NOT_OPEN` | Voucher already dispensed or cancelled. |
+| 409 | `PHARMACY_DISPENSE_NOT_ALLOWED_FOR_CBHI` | `/pharmacy/*` received `scheme:"CBHI"`. |
+
+## RAMA-specific validation
+
+| code | When |
+| --- | --- |
+| `DIAGNOSIS_WITHOUT_PRESCRIPTIONS` | Diagnosis lines present but no drug/consumable services. |
+| `PRESCRIPTIONS_WITHOUT_DIAGNOSIS` | Drug/consumable services without at least one diagnosis code. |
+| `DIAGNOSIS_REQUIRED_FOR_TRANSFER` | Transfer out without a diagnosis code. |
+| `PATIENT_WEIGHT_REQUIRED` | Prescription requires weight (paediatric dosing). |
+| `INVALID_VOUCHER_NUMBER` | Paper voucher code does not parse. |
+| `MEDICAL_ADVISOR_APPROVAL_REQUIRED` | Save attempted on a visit requiring pre-auth. |
+| `VOUCHER_DATE_OUTSIDE_INVOICE_PERIOD` | `dispensingDate` outside monthly invoice window. |
+| `NO_BILLABLE_PRESCRIPTIONS` | Validated pharmacy visit has zero dispensed items. |
+| `TREATMENT_DATE_TOO_OLD` | `treatmentDate` violates the 30-day rule. |
+
+## Prescription fields
+
+| code | When |
+| --- | --- |
+| `PRESCRIPTION_INCOMPLETE` | Drug/consumable line missing `dosage`/`posology`/`frequency`/`route`/`durationDays`. |
+| `INVALID_FREQUENCY` | `frequency` value is off-enum. |
+| `INVALID_ROUTE` | `route` value is off-enum. |
+| `CUSTOM_HOURS_REQUIRED` | `frequency=CUSTOM_HOURS` without `customHours[]`. |
+
+## Validation
+
+400 responses with `code:"VALIDATION_ERROR"` include a `details[]` array of `{ field, message }` pairs — one per invalid property. Iterate and surface per-field in your UI.
+
+<Warning>**Retry policy.** Retry 5xx with exponential backoff. Never retry 4xx *except* `TOKEN_EXPIRED` (after refreshing). Retrying `VALIDATION_ERROR` won't fix itself — fix the request body.</Warning>

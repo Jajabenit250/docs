@@ -1,0 +1,93 @@
+---
+title: "Alternate lookup keys"
+description: "Partners hold different identifiers. Every lookup endpoint takes a single {code} path parameter and resolves it against all supported keys for that resource."
+---
+
+<Note>**Rule** — You don't have to pre-translate identifiers. Send what you already hold; Kwivuza returns the canonical key alongside everything else. Use the canonical key on subsequent calls.</Note>
+
+Partners hold different identifiers. MOH systems know facilities by Minisante matricule; RRA knows them by TIN; procurement by supplier code; clinicians by name. Kwivuza accepts any of them — every lookup endpoint takes a single `{code}` path parameter and resolves it against *all* supported keys for that resource.
+
+## Facilities — `GET /facilities/{code}`
+
+| Accepted as `{code}` | Example |
+| --- | --- |
+| `fosaId` (canonical) | `MF00632` |
+| `matriculeMinisante` | `30311017` |
+| `supplierCode` | `SUP-0041` |
+| `tin` | `102345678` |
+| `name` (exact) | `Ruhenda Health Centre` |
+
+Search (`GET /facilities?query=`) additionally matches `alternateNames[]`, district, sector, and level.
+
+## Practitioners — `GET /practitioners/{code}`
+
+| Accepted as `{code}` | Example |
+| --- | --- |
+| `licenseNumber` (canonical) | `RMDC-12345` |
+| `alternateLicenseNumbers[]` | `NCNM-A1-00998`, legacy MoH licences |
+| `nationalId` | `1198780012345678` |
+| `passportNumber` (foreign) | `PB3342211` |
+| `phoneNumber` | `+250788123456` |
+| `email` | `j.mukamana@chuk.rw` |
+
+## Products — `GET /products/{code}`
+
+| Accepted as `{code}` | Example |
+| --- | --- |
+| `productCode` (canonical) | `DRG-00412` |
+| `alternateCodes[]` | pharmacy POS codes, distributor SKUs |
+| `atcCode` | `J01CA04` |
+
+Search (`GET /products?query=&scheme=`) also matches `name`, `alternateNames[]`, and `genericName`.
+
+## Diagnoses — `GET /diagnoses/{code}`
+
+| Accepted as `{code}` | Example |
+| --- | --- |
+| `diagnosisCode` (ICD-11, canonical) | `1E32`, `BA00` |
+| `icd10Code` | `A09`, `I10` |
+
+## Patients (CBHI & RAMA) — single `memberId`
+
+Every patient lookup — eligibility, patient visits, pre-auth, pharmacy — takes a single `memberId` field (alias: `patientId`). Send whichever unique identifier the partner already holds for that scheme; Kwivuza resolves it against *all* supported keys.
+
+<CardGroup cols={2}>
+  <Card title="CBHI memberId" icon="users">
+    | Key | Example |
+    | --- | --- |
+    | `householdCode` | `HH-RW-0001` |
+    | `lodaNumber` | `LODA-2024-0012345` |
+    | `householdHeadNationalId` | `1197080098765432` |
+    | `memberNumber` | `HH-RW-0001-03` |
+    | `memberNationalId` | `1200870012345678` |
+  </Card>
+  <Card title="RAMA memberId" icon="briefcase">
+    | Key | Example |
+    | --- | --- |
+    | `beneficiaryNumber` | `RAMA-00045678` |
+    | `mainCardNumber` | `MC-445566` |
+    | `nationalId` | `1198780012345678` |
+    | `passportNumber` | `PB3342211` |
+  </Card>
+</CardGroup>
+
+Examples:
+
+```json
+{ "scheme": "CBHI", "memberId": "1200870012345678" }
+{ "scheme": "CBHI", "memberId": "HH-RW-0001" }
+{ "scheme": "RAMA", "memberId": "RAMA-00045678" }
+{ "scheme": "RAMA", "memberId": "PB3342211" }
+```
+
+`patientId` is accepted everywhere `memberId` is — use whichever key your domain already names it. The response always echoes back the **canonical** identifier (`householdCode` + `memberNumber` for CBHI; `beneficiaryNumber` for RAMA).
+
+## Resolution rules
+
+- **First-match wins.** Keys are matched in declared order. Ambiguity is impossible because key formats don't overlap.
+- **Exact match only.** No fuzzy matching on identifier endpoints. Use `?query=` search endpoints for prefix / substring.
+- **Case.** Names and alternate names are case-insensitive; all other keys are case-sensitive.
+- **Canonical echoback.** Responses always include the canonical key (`fosaId`, `licenseNumber`, `productCode`, `beneficiaryNumber`, `householdCode` + `memberNumber`) so downstream calls use stable identifiers.
+- **Unified `memberId`.** All patient-addressing endpoints accept one `memberId` field per scheme. You do not have to disambiguate — the resolver inspects the scheme and tries each supported key in order.
+
+<Tip>**Store the canonical key** after your first lookup. Never re-resolve on every call — it's cheap but wasteful, and caches your side against stale aliases.</Tip>

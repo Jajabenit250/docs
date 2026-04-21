@@ -1,0 +1,165 @@
+---
+title: "Pharmacy items in services[] & prescription routing"
+description: "In v1.2 every line on /patient-visits lives in one merged services[] array; drug items carry frequency/durationDays/posology, and the top-level prescriptionDestination decides whether drugs are dispensed in-house or released as a system-wide e-prescription."
+---
+
+<Note>**Mental model** — One array, many line kinds. Each entry in `services[]` is identified by its `code`; the gateway resolves it against the product catalogue to classify the line as a medical act, lab exam, imaging study, drug, or consumable. The extra drug-only fields (`frequency`, `durationDays`, `posology`) are inline on the same object — there is no separate `pharmacyServices` block. Keeping everything in `services[]` means one validation pass, one pricing pass, one line-level pending-approval report.</Note>
+
+## Item shape in `services[]`
+
+```json
+"services": [
+  { "code": "ACT-0100", "quantity": 1 },
+  { "code": "LAB-0201", "quantity": 1 },
+  {
+    "code": "C09AA05",
+    "frequency": "QD",
+    "durationDays": 30,
+    "posology": "1 tablet in the morning"
+  },
+  { "code": "CONS-SYR-5ML", "quantity": 2 }
+]
+```
+
+### Fields on a drug item
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `code` | ✓ | Any accepted product key: `productCode`, `atcCode`, pharmacy POS code (`alternateCodes[]`). |
+| `frequency` | ✓ | Enum: `QD`, `BID`, `TID`, `QID`, `QHS`, `FIVE_TIMES_A_DAY`, `Q4H`, `Q6H`, `QOD`, `PRN`, `ONCE_A_WEEK`, `CUSTOM_HOURS`. |
+| `customHours` | cond. | Required when `frequency=CUSTOM_HOURS`. e.g. `["08:00","20:00"]`. |
+| `durationDays` | ✓ | Integer ≥ 1. Drives quantity-to-dispense and the computed `amount`. |
+| `posology` | ✓ | Patient-facing instruction. Free text. |
+
+### Fields on a consumable item
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `code` | ✓ | Product key. |
+| `quantity` | ✓ | Integer ≥ 1. |
+
+## Routing with top-level `prescriptionDestination`
+
+`prescriptionDestination` is now an optional top-level field on `/patient-visits` — no longer nested inside a pharmacy wrapper. It governs how drug lines in `services[]` are dispensed.
+
+<CardGroup cols={2}>
+  <Card title="FACILITY_DISPENSE (default)" icon="hospital">
+    Drugs are dispensed by the caller's own pharmacy counter. No system-wide e-Rx is minted. Used by:
+
+    - Hospital OPD with an in-house pharmacy that stocks the drug.
+    - Private pharmacy walk-ins (Flow B) — the caller *is* the dispensing facility.
+    - CBHI visits (always — CBHI does not circulate e-Rx).
+  </Card>
+  <Card title="PHARMACY" icon="tower-broadcast">
+    Creates a system-wide RAMA e-prescription. Any RAMA-contracted pharmacy can look it up by `memberId` and dispense. Used by:
+
+    - Hospitals routing chronic-care refills to the patient's preferred pharmacy.
+    - Hospitals without an in-house pharmacy that stocks the specific drug.
+
+    **RAMA only.** `CBHI` + `PHARMACY` returns `PHARMACY_DESTINATION_NOT_ALLOWED_FOR_CBHI`.
+  </Card>
+</CardGroup>
+
+## Decision tree
+
+| Caller | Scheme | Default | May override to `PHARMACY`? |
+| --- | --- | --- | --- |
+| Hospital EMR | RAMA | `FACILITY_DISPENSE` | Yes |
+| Hospital EMR | CBHI | `FACILITY_DISPENSE` | No |
+| Pharmacy EMR | RAMA | `FACILITY_DISPENSE` | No — you're the pharmacy |
+| MOH E-Ubuzima | RAMA | — | Yes (orchestrator on behalf of a hospital) |
+
+## Worked examples
+
+### 1. Hospital prescribes antihypertensive chronic refill → to the patient's pharmacy
+
+```json
+{
+  "prescriptionDestination": "PHARMACY",
+  "services": [
+    {
+      "code": "C09AA05",
+      "frequency": "QD",
+      "durationDays": 90,
+      "posology": "1 tablet in the morning"
+    }
+  ]
+}
+```
+
+Result: a `PENDING_PHARMACY_DISPENSING` e-Rx. Patient walks into any RAMA pharmacy, which queries by `memberId` and fulfils.
+
+### 2. Hospital in-house dispense — antibiotics course + IV line
+
+```json
+{
+  "prescriptionDestination": "FACILITY_DISPENSE",
+  "services": [
+    { "code": "ACT-CONS-GEN", "quantity": 1 },
+    {
+      "code": "J01CA04",
+      "frequency": "TID",
+      "durationDays": 7,
+      "posology": "500 mg every 8 hours"
+    },
+    { "code": "CONS-IV-18G", "quantity": 1 }
+  ]
+}
+```
+
+Result: billed on the same visit, no e-Rx leaves the facility.
+
+### 3. Custom-hours dosing
+
+```json
+"services": [{
+  "code": "N02BE01",
+  "frequency": "CUSTOM_HOURS",
+  "customHours": ["07:00", "13:00", "19:00", "23:00"],
+  "durationDays": 5,
+  "posology": "1 tablet at scheduled times"
+}]
+```
+
+## Response items carry `unitPrice` and `amount`
+
+Every item echoed back on the visit response includes its `type` (enum `MEDICAL_ACT`, `LAB_EXAM`, `IMAGING`, `DRUG`, `CONSUMABLE`), its `unitPrice`, and its computed `amount` (integers, RWF). For drugs, `amount = unitPrice × durationDays`. For everything else, `amount = unitPrice × quantity`.
+
+```json
+"services": [
+  { "code": "ACT-0100",      "type": "MEDICAL_ACT", "quantity": 1,      "unitPrice": 5000, "amount": 5000 },
+  { "code": "C09AA05",       "type": "DRUG",        "durationDays": 30, "unitPrice": 120,  "amount": 3600 },
+  { "code": "CONS-SYR-5ML",  "type": "CONSUMABLE",  "quantity": 2,      "unitPrice": 250,  "amount": 500  }
+]
+```
+
+## Per-item pending approval (RAMA)
+
+If a drug, consumable, or any other line is on the RAMA pre-authorization list, the `/patient-visits` response surfaces that specific line — you do not discover it only at dispensing time. Each entry points back to the submitted `code` with an auto-opened `preAuthReference`:
+
+```json
+"pendingApprovalItems": [
+  {
+    "code": "L01XC02",
+    "status": "PENDING_MEDICAL_ADVISOR_APPROVAL",
+    "reason": "REQUIRES_PRE_AUTHORIZATION",
+    "preAuthReference": "PA-20260420-0014",
+    "message": "Biologic requires medical-advisor approval."
+  }
+]
+```
+
+Render each entry as a "pending approval" badge next to the line in your UI. Dispense only when the advisor webhook fires `APPROVED` / `APPROVED_WITH_ADJUSTMENT`. See the [pre-authorization guide](/guides/use-cases/pre-authorization) for lifecycle details.
+
+## Validation errors
+
+| code | When |
+| --- | --- |
+| `PHARMACY_DESTINATION_NOT_ALLOWED_FOR_CBHI` | `scheme=CBHI` + `prescriptionDestination=PHARMACY`. |
+| `SERVICES_REQUIRED` | `/patient-visits` called with an empty `services[]`. |
+| `INVALID_FREQUENCY` | Off-enum `frequency` on a drug line. |
+| `CUSTOM_HOURS_REQUIRED` | `frequency=CUSTOM_HOURS` without `customHours[]`. |
+| `DURATION_DAYS_REQUIRED` | Drug line missing `durationDays`. |
+| `PRODUCT_NOT_ON_FORMULARY` | Drug code isn't on the scheme's formulary for this facility level. |
+
+<Tip>**No `quantity` on drug lines — on purpose.** Historically partners miscomputed quantity vs duration, producing disputes. The gateway now derives dispensable quantity from `frequency` × `durationDays` against the product's unit-dose metadata.</Tip>

@@ -1,0 +1,113 @@
+---
+title: "Webhooks"
+description: "Register an HTTPS endpoint and receive signed event callbacks whenever a visit, voucher, or pre-auth changes state — no polling required."
+---
+
+<Note>**Why webhooks** — Polling `/status-history` works, but it burns quota and lags behind reality. Subscribe once, verify the signature, and react in seconds. The gateway retries for up to ~14 hours, so a brief outage on your side won't lose events.</Note>
+
+## Register a subscription
+
+<Steps>
+  <Step title="Call POST /webhooks">
+    Pick only the events you care about. You can register multiple subscriptions per partner (e.g. one for claims ops, one for finance).
+
+    ```http
+    POST /api/v1/partner/webhooks
+    {
+      "targetUrl": "https://partner.example.rw/kwivuza/events",
+      "events": [
+        "rama.patient-visit.created",
+        "rama.patient-visit.status-changed",
+        "rama.preauth.decided"
+      ],
+      "description": "Claims ops pipeline"
+    }
+    ```
+  </Step>
+
+  <Step title="Store the secret returned in the response">
+    The gateway returns the HMAC signing secret **once**. Put it straight into your secret manager — there is no way to fetch it again. To rotate: delete the subscription and register a new one.
+  </Step>
+
+  <Step title="Return 2xx within 10 seconds">
+    Your endpoint must respond quickly. Enqueue the payload to a background worker and acknowledge immediately; do not process the event inline.
+  </Step>
+</Steps>
+
+## Event catalogue
+
+These are the six canonical events. Call `GET /webhooks/events` for the authoritative list.
+
+| Event | Fired when |
+| --- | --- |
+| `cbhi.patient-visit.created` | A CBHI visit has been recorded via `POST /patient-visits`. |
+| `cbhi.patient-visit.status-changed` | A CBHI visit transitioned state (e.g. `UNDER_REVIEW` → `APPROVED` / `REJECTED`). |
+| `rama.patient-visit.created` | A RAMA visit has been recorded. |
+| `rama.patient-visit.status-changed` | A RAMA visit transitioned state. |
+| `rama.voucher.dispensed` | A RAMA voucher reached `DISPENSED`. |
+| `rama.preauth.decided` | Medical advisor decided on a pre-authorization. |
+
+## Verify the signature
+
+Every delivery carries an `X-Kwivuza-Signature` header: base64-encoded `HMAC-SHA256` over the **raw** request body using the subscription secret. Always verify before trusting the payload.
+
+```js
+// Node.js — Express example
+import crypto from "node:crypto";
+
+app.post("/kwivuza/events",
+  express.raw({ type: "application/json" }),   // keep bytes intact
+  (req, res) => {
+    const expected = crypto
+      .createHmac("sha256", process.env.KWIVUZA_WEBHOOK_SECRET)
+      .update(req.body)
+      .digest("base64");
+
+    const got = req.get("X-Kwivuza-Signature") || "";
+    const ok = expected.length === got.length &&
+               crypto.timingSafeEqual(Buffer.from(expected), Buffer.from(got));
+    if (!ok) return res.status(401).end();
+
+    queue.enqueue(JSON.parse(req.body));        // hand off, then ack
+    res.status(202).end();
+  });
+```
+
+<Warning>**Raw body, not parsed.** If your framework parses JSON before you can capture the bytes, the HMAC will not match. Use `express.raw`, Fastify's `rawBody`, or the equivalent for your stack.</Warning>
+
+## Delivery semantics
+
+- **At-least-once.** The gateway retries on connection errors and `5xx` responses with exponential backoff: 1 min → 5 min → 25 min → 2 h → 12 h, max 6 attempts.
+- **Idempotency.** Each delivery carries `X-Kwivuza-Delivery-Id`. Store seen IDs and drop duplicates — two retries of the same event will share the ID.
+- **Ordering is not guaranteed.** Payloads include `occurredAt`; rely on it rather than arrival order.
+- **10-second timeout.** 2xx within 10 s marks the delivery `DELIVERED`; anything else is `FAILED` and retried.
+- **TLS required.** `targetUrl` must be `https://` with a valid certificate. Self-signed certs are rejected.
+
+## Inspect deliveries
+
+Debug a missing event by listing recent deliveries for a subscription. Useful when your endpoint was down — you can see each attempt, status, and the exact payload signed.
+
+```http
+GET /api/v1/partner/webhooks/WHK-20260420-0001/deliveries
+
+{
+  "data": [
+    {
+      "deliveryReference": "WHK-DLV-20260420-0012",
+      "event": "rama.patient-visit.status-changed",
+      "status": "DELIVERED",
+      "attempt": 1,
+      "signature": "MEQC...=",
+      "payload": {
+        "visitReference": "VST-20260420-0001",
+        "status": "REJECTED",
+        "reasonCode": "MISSING_SUPPORTING_DOCUMENT"
+      },
+      "createdAt": "2026-04-20T11:00:03Z",
+      "lastAttemptAt": "2026-04-20T11:00:04Z"
+    }
+  ]
+}
+```
+
+<Tip>**Local testing.** The mock server delivers webhooks to any URL you register — pair it with `ngrok` or `cloudflared` to test your handler end-to-end before pointing at sandbox.</Tip>

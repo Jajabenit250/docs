@@ -1,0 +1,67 @@
+---
+title: "The scheme field"
+description: "Kwivuza unifies two national health-financing schemes — CBHI (community) and RAMA (formal sector) — behind one API. A single top-level scheme field routes multi-scheme requests to the right backend and applies the right business rules."
+---
+
+<Note>**Mental model** — Think of `scheme` as a switch that says "which insurance is paying?" Every endpoint that touches money or clinical data needs this; reference-data lookups (facility, practitioner, diagnosis) do not.</Note>
+
+## Values
+
+<CardGroup cols={2}>
+  <Card title="CBHI (community)" icon="users">
+    Community-Based Health Insurance — households, ubudehe categories, LODA. Patient identified by a single `memberId` (any of: `householdCode`, `householdHeadNationalId`, `lodaNumber`, `memberNumber`, `memberNationalId`).
+
+    **Reimbursement:** scheme-side monthly aggregate; partners record individual visits and track status via webhook.
+  </Card>
+  <Card title="RAMA (formal sector)" icon="briefcase">
+    Formal-sector scheme with pharmacy vouchers and e-prescriptions. Patient identified by a single `memberId` (any of: `beneficiaryNumber`, `mainCardNumber`, `nationalId`, `passportNumber`).
+
+    **Reimbursement:** per-visit voucher; status changes arrive via webhook.
+  </Card>
+</CardGroup>
+
+## Where `scheme` is required
+
+| Endpoint | Why |
+| --- | --- |
+| `POST /eligibility/check` | Body is a `oneOf` discriminated by `scheme`. |
+| `POST /patient-visits` | Routes the visit record to the correct backend. |
+| `GET /products?scheme=…` | Tariffs are scheme-specific. |
+| `POST /tariff-update-requests` | Facility tariff changes route per scheme. |
+
+## Where `scheme` is optional or ignored
+
+- Facility, practitioner, and diagnosis lookups — shared reference data.
+- `/pharmacy/*` endpoints — always RAMA. `scheme=CBHI` is hard-rejected with `PHARMACY_DISPENSE_NOT_ALLOWED_FOR_CBHI`.
+
+## Scope enforcement
+
+The gateway checks `request.scheme ∈ token.allowedSchemes` before dispatching. A pharmacy credential with `allowedSchemes:["RAMA"]` sending `scheme:"CBHI"` receives:
+
+```json
+{
+  "error": {
+    "code": "SCHEME_NOT_ALLOWED",
+    "message": "Your credential is not authorised for scheme CBHI"
+  }
+}
+```
+
+## Discriminated eligibility payloads
+
+Same endpoint, two body shapes — one per scheme. The OpenAPI spec models this with a `oneOf` discriminator so code generators produce proper union types.
+
+```json
+// CBHI — one memberId, any supported key
+{ "scheme": "CBHI", "memberId": "1200870012345678" }
+
+// Or use the household key — same field
+{ "scheme": "CBHI", "memberId": "HH-RW-0001" }
+
+// RAMA — one memberId
+{ "scheme": "RAMA", "memberId": "RAMA-00045678" }
+```
+
+`patientId` is an accepted alias if your domain already names it that way. See [Alternate lookup keys](/guides/getting-started/lookup-keys) for the full table.
+
+<Tip>**Rule of thumb:** If the endpoint path mentions a claim, eligibility, or money, include `scheme`. If it just looks up a code → name, skip it.</Tip>

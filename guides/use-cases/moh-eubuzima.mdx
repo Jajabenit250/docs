@@ -1,0 +1,118 @@
+---
+title: "MOH E-Ubuzima walkthrough"
+description: "One credential, every facility, both schemes — the integration shape for the Ministry of Health's national platform, the only credential that must explicitly supply fosaId on clinical calls."
+---
+
+One credential, every facility, both schemes. This is the integration shape for the Ministry of Health's national platform — national dashboards, bulk invoice orchestration, and cross-facility reporting. Because E-Ubuzima acts on behalf of every FOSA, this is the **only** credential type that must explicitly supply `fosaId` on clinical calls.
+
+<Note>**What you'll build** — An orchestrator that resolves facilities by matricule, ingests visits across all FOSAs with the unified `memberId` and a merged `services[]`, subscribes to status-changed and pre-auth webhooks, and submits pre-authorization with a plain-text `clinicalKnowledge` narrative. _**Time:** ~45 min end-to-end · **Scope:** `CBHI`+`RAMA`, all facilities, no pharmacy_</Note>
+
+## Credential scope
+
+- **`allowedSchemes: ["CBHI", "RAMA"]`** — both schemes.
+- **`allowedFosaIds: "*"`** — wildcard over every facility. Because the session isn't bound to one FOSA, clinical calls **must** include `fosaId`.
+- **`allowPharmacy: false`** — MOH orchestrates; it doesn't dispense.
+
+## Walkthrough
+
+<Steps>
+  <Step title="Authenticate">
+    Exchange your service credential for an 8-hour JWT. Refresh before `exp`.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/session \
+      -H 'Content-Type: application/json' \
+      -d '{"serviceName":"moh-eubuzima","serviceSecret":"demo-moh-secret"}'
+    ```
+  </Step>
+  <Step title="Resolve the facility by Minisante matricule">
+    MOH systems key facilities by matricule. The single-`{code}` lookup accepts it and returns the canonical `fosaId`. Store it and use it downstream.
+
+    ```bash
+    curl http://localhost:4010/api/v1/partner/facilities/30311017 \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Step>
+  <Step title="Check CBHI eligibility — single memberId">
+    Pass whichever identifier the E-Ubuzima desk has — household code, head NID, LODA, member number, or member NID. The resolver tries each.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/eligibility/check \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "scheme": "CBHI",
+        "memberId": "1200870012345678"
+      }'
+    ```
+  </Step>
+  <Step title="Record the visit — explicit fosaId required">
+    One `POST /patient-visits` per encounter. Because MOH is cross-facility, the call _must_ say which FOSA the encounter happened at. Every line — act, lab, drug, consumable — lives in the merged `services[]` array.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/patient-visits \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "scheme": "CBHI",
+        "fosaId": "MF00632",
+        "practitionerLicenseNumber": "RMDC-12345",
+        "memberId": "1200870012345678",
+        "healthCareStayType": "OUT_PATIENT",
+        "admissionDate": "2026-04-20",
+        "diagnosisCodes": ["1E32"],
+        "services": [
+          { "code": "DRG-00412", "quantity": 1 },
+          { "code": "ACT-0100",  "quantity": 1 }
+        ]
+      }'
+    ```
+  </Step>
+  <Step title="Pre-authorize expensive RAMA services with clinicalKnowledge">
+    CT, MRI, dialysis, and major surgery require a medical-advisor decision before care. The request carries a plain-text `clinicalKnowledge` narrative — see the [pre-authorization guide](/guides/use-cases/pre-authorization) for details.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/pre-authorizations \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "fosaId": "30311017",
+        "practitionerLicenseNumber": "RMDC-23456",
+        "memberId": "RAMA-00045678",
+        "diagnosisCodes": ["BA00"],
+        "products": [{ "code": "SRV-MRI", "quantity": 1 }],
+        "clinicalKnowledge": "45F with 3-week worsening right-sided headache, focal weakness. CT inconclusive. MRI requested to rule out intracranial mass."
+      }'
+    ```
+  </Step>
+  <Step title="Subscribe to national-dashboard webhooks">
+    Register once. You'll receive signed callbacks for visit status changes and pre-auth decisions across every facility.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/webhooks \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "targetUrl": "https://e-ubuzima.moh.gov.rw/kwivuza/events",
+        "events": [
+          "cbhi.patient-visit.created",
+          "cbhi.patient-visit.status-changed",
+          "rama.patient-visit.created",
+          "rama.patient-visit.status-changed",
+          "rama.preauth.decided"
+        ]
+      }'
+    ```
+
+    Signature verification and retry semantics: see the [webhooks guide](/guides/getting-started/webhooks).
+  </Step>
+</Steps>
+
+## Operational tips
+
+- **Paginate the facility sync.** `GET /facilities` returns ~1,200 rows nationally — walk `nextPageToken`.
+- **Cache reference data.** `/practitioners/types`, `/diagnoses`, and `/products` change at most quarterly.
+- **Use `partnerVisitId` for idempotency.** Retrying `POST /patient-visits` with the same value returns the original `visitReference`.
+- **No monthly invoice step.** Lifecycle ends at "visit recorded → status updates via webhook" — there is no `/invoices` or adjustment endpoint to call.
+- **One `memberId` everywhere.** Don't re-derive a scheme-specific key; pass whichever identifier the desk already has, the gateway resolves.
+- **Split subscriptions.** One webhook for claims-ops, another for finance. Smaller event sets mean smaller blast radius when you rotate a secret.
+
+<Tip>
+  **Reporting.** For national rollups, read approved visits via `GET /patient-visits?status=APPROVED&from=…&to=…` and aggregate offline — don't hammer `/status-history` per visit.
+</Tip>

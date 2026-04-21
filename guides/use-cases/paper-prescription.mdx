@@ -1,0 +1,84 @@
+---
+title: "Recording paper prescriptions"
+description: "When a RAMA patient arrives at a pharmacy with a paper prescription from outside Kwivuza, POST /pharmacy/paper-prescriptions registers the encounter so the gateway can mint an e-prescription after the fact and the voucher reimburses as normal."
+---
+
+<Note>**Mental model** — Everything else in the system starts with a hospital `/patient-visits` call. Paper prescriptions don't have one. You are telling the gateway: "this RAMA member showed up with a prescription from *that* facility, written by *that* practitioner, on *that* date — here are the drugs. Turn it into a dispensable Rx."</Note>
+
+## Request shape
+
+```json
+POST /api/v1/partner/pharmacy/paper-prescriptions
+{
+  "scheme": "RAMA",
+  "memberId": "RAMA-00045678",
+
+  // Who wrote the prescription — any unique facility code
+  "prescribingFacility": "30311017",           // matricule OR fosaId OR tin OR name
+
+  "prescriptionDate": "2026-04-18",
+
+  "services": [
+    { "code": "C09AA05", "frequency": "QD", "durationDays": 30, "posology": "1 tab AM" },
+    { "code": "CONS-SYR-5ML", "quantity": 1 }
+  ],
+
+  "externalReference": "HANDWRITTEN-0042",     // optional, for your records
+  "attachments": [                             // optional scanned image
+    { "type": "RX_IMAGE", "reference": "DOC-20260420-0011" }
+  ]
+}
+```
+
+<Info>**Pharmacies dispense drugs and consumables only.** `services[]` on this endpoint accepts products of type `DRUG` or `CONSUMABLE` only. Any medical act, lab, or imaging code returns `PRODUCT_TYPE_NOT_ALLOWED_FOR_PHARMACY`. Drug lines carry `frequency` / `durationDays` / `posology`; consumable lines carry `quantity`.</Info>
+
+## Facility resolution
+
+Because the pharmacist is reading a paper artifact, they shouldn't be forced to translate identifiers. The gateway accepts any unique code as `prescribingFacility`:
+
+<Card title="prescribingFacility — any one of" icon="id-card">
+  | Identifier | Example |
+  | --- | --- |
+  | `fosaId` | `MF00632` |
+  | `matriculeMinisante` | `30311017` |
+  | `tin` | `102345678` |
+  | `name` | `Kibagabaga Hospital` |
+</Card>
+
+Pass the identifier as a plain string. If it doesn't resolve, you get `PRESCRIBING_FACILITY_NOT_RESOLVED` and no Rx is minted. The prescribing *practitioner* is not required on a paper-Rx — the pharmacy is responsible for the dispense record; the facility alone anchors the external origin for audit.
+
+## Response
+
+```json
+{
+  "paperPrescriptionReference": "PPR-20260420-1007",
+  "status": "REGISTERED",
+  "prescribingFacility": { "fosaId": "MF00632", "name": "Kibagabaga Hospital" },
+  "prescriptionDate": "2026-04-18",
+  "services": [ … ]
+}
+```
+
+The `paperPrescriptionReference` is immediately dispensable — same endpoint as a hospital-minted e-Rx:
+
+```bash
+curl -X POST http://localhost:4010/api/v1/partner/pharmacy/prescriptions/PPR-20260420-1007/fulfil \
+  -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{ "quantity": 30 }'
+```
+
+## Rules & constraints
+
+- **RAMA only.** `scheme=CBHI` returns `PHARMACY_DISPENSE_NOT_ALLOWED_FOR_CBHI`.
+- **Pharmacy credential only.** Hospital or MOH credentials calling this endpoint get `ROUTE_NOT_AVAILABLE_FOR_ROLE`.
+- **Drugs and consumables only.** `services[]` rejects any non-`DRUG`/`CONSUMABLE` product with `PRODUCT_TYPE_NOT_ALLOWED_FOR_PHARMACY`. Pharmacies never bill medical acts, labs, or imaging.
+- **Prescription date window.** `prescriptionDate` must be within the last 30 days. Older papers are assumed expired; set up a process to escalate to the prescribing clinic instead of backdating.
+- **Pre-auth products.** If any drug triggers pre-authorization, the response comes back `PENDING_MEDICAL_ADVISOR_APPROVAL` instead of `REGISTERED`. Don't dispense until the advisor webhook fires.
+
+## Audit trail
+
+Every paper-Rx record keeps:
+
+- The exact identifiers you submitted (so an auditor can see *what the pharmacist read*, not just the canonical resolution).
+- Any attached document references.
+- The resolving pharmacist's session identity (from the JWT) as the **recorder**, distinct from the prescriber.

@@ -1,0 +1,78 @@
+---
+title: "Authentication"
+description: "Every partner endpoint except POST /session requires a Bearer JWT. Tokens are issued per service account and carry scope claims the gateway enforces on every request."
+---
+
+<Note>
+  **What you'll do** — Exchange a `serviceName` + `serviceSecret` for a Bearer JWT, inspect what your token can and can't do, and use it on a protected endpoint.
+
+  - **Time:** ~2 min
+  - **Prereqs:** demo credentials (below)
+  - **You'll end with:** a cached token and a verified protected call
+</Note>
+
+## Step-by-step
+
+<Steps>
+  <Step title="Get a demo credential (mock only)">
+    For local development, five credentials are pre-seeded. Pick the one that matches the persona you're building for.
+
+    | serviceName | serviceSecret | Scope |
+    | --- | --- | --- |
+    | `moh-eubuzima` | `demo-moh-secret` | All facilities, both schemes |
+    | `chuk-emr` | `demo-hospital-secret` | CHUK only, both schemes |
+    | `kibagabaga-emr` | `demo-hospital-secret-2` | Kibagabaga only, both schemes |
+    | `conseil-pharmacy` | `demo-pharmacy-secret` | Conseil Pharmacy, RAMA only |
+    | `peuple-pharmacy` | `demo-pharmacy-secret-2` | Pharmacie du Peuple, RAMA only |
+  </Step>
+
+  <Step title="Exchange credentials for a token">
+    POST your `serviceName` + `serviceSecret` to `/session`. You get back a Bearer JWT plus the scope claims so you know what it covers.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/session \
+      -H 'Content-Type: application/json' \
+      -d '{"serviceName":"moh-eubuzima","serviceSecret":"demo-moh-secret"}'
+    ```
+  </Step>
+
+  <Step title="Inspect the response">
+    Every `/session` response lists the scopes the token carries. Your backend should log these — if anything changes (new facility, new scheme) you'll see it here first.
+
+    ```json
+    {
+      "token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+      "expiresAt": "2026-04-20T18:00:00Z",
+      "serviceName": "moh-eubuzima",
+      "allowedSchemes": ["CBHI", "RAMA"],
+      "allowedFosaIds": "*",
+      "allowPharmacy": false
+    }
+    ```
+
+    | Claim | Meaning |
+    | --- | --- |
+    | `allowedSchemes` | Subset of `["CBHI","RAMA"]` this credential may act on. Requests with a `scheme` outside this set return `SCHEME_NOT_ALLOWED`. |
+    | `allowedFosaIds` | Either `"*"` (all facilities, MOH-style) or an explicit array of `fosaId` strings. Out-of-scope requests return `FACILITY_NOT_IN_SCOPE`. |
+    | `allowPharmacy` | Gates `/pharmacy/*` endpoints. Non-pharmacy partners receive `PHARMACY_NOT_ALLOWED`. |
+  </Step>
+
+  <Step title="Send the token on a protected call">
+    Put the `token` value in the `Authorization: Bearer` header on every request. Here, we resolve a facility by its FOSA code — a good first-request smoke test.
+
+    ```bash
+    curl http://localhost:4010/api/v1/partner/facilities/MF00632 \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Step>
+
+  <Step title="Rotate & refresh">
+    Tokens live 8 hours in production (2 h on the mock). There is no refresh endpoint — just call `/session` again before expiry. Compromised secrets can be revoked instantly by your partner manager.
+
+    - Re-authenticate **before** `expiresAt`, not after a 401.
+    - Retrying on `TOKEN_EXPIRED` is the only 4xx you should retry automatically.
+    - Store `serviceSecret` in your secret manager — never in source, never in logs.
+  </Step>
+</Steps>
+
+<Tip>**You're done with auth.** Next, learn how to target the right base URL for each environment.</Tip>

@@ -1,0 +1,84 @@
+---
+title: "Kwivuza Partner API"
+description: "One unified integration surface for partners sending data to or querying data from Rwanda's national CBHI and RAMA claim-management platform."
+---
+
+<Note>
+  **v1.2** — merged `services[]`, string `clinicalKnowledge`, top-level `prescriptionDestination`, unified webhook set.
+</Note>
+
+## Three partner personas
+
+<CardGroup cols={3}>
+  <Card title="MOH E-Ubuzima" icon="building-columns" href="/guides/use-cases/moh-eubuzima">
+    One credential, **all facilities**, both schemes. Best for national dashboards and cross-facility reporting.
+    <br />`CBHI + RAMA`
+  </Card>
+  <Card title="Hospital EMR" icon="hospital" href="/guides/use-cases/hospital-emr">
+    One credential scoped to a **single facility**. Records visits, writes pharmacy e-prescriptions, submits pre-auths.
+    <br />`CBHI + RAMA`
+  </Card>
+  <Card title="Pharmacy EMR" icon="pills" href="/guides/use-cases/pharmacy-emr">
+    **RAMA only.** Fulfils hospital-written e-prescriptions and registers paper prescriptions.
+    <br />`RAMA only`
+  </Card>
+</CardGroup>
+
+## Design principles
+
+- **Codes, not UUIDs.** Every payload uses human-readable codes (`fosaId`, `practitionerLicenseNumber`, `productCode`, ICD-11 `diagnosisCode`, `nationalId`, `beneficiaryNumber`).
+- **Multiple alternate keys.** Facilities by FOSA, Minisante matricule, supplier, or TIN. Practitioners by licence, alt-licence, NID, passport, or phone. Products by product code, alt-code, ATC, or name.
+- **One `scheme` field.** `"CBHI"` or `"RAMA"` on every multi-scheme request. The gateway enforces scope against your JWT.
+- **Unified error envelope.** `{ error: { code, message, details[] } }` with stable codes across both schemes.
+- **Idempotent writes.** Safe to retry — pass `X-Idempotency-Key` and we'll return the cached result for 24 hours.
+
+## Quickstart
+
+Three requests and you've exercised auth, lookup, and eligibility.
+
+<Steps>
+  <Step title="Authenticate">
+    Exchange a service secret for a Bearer token.
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/session \
+      -H 'Content-Type: application/json' \
+      -d '{"serviceName":"moh-eubuzima","serviceSecret":"demo-moh-secret"}'
+    ```
+  </Step>
+  <Step title="Look up a facility">
+    By any of its codes.
+    ```bash
+    curl http://localhost:4010/api/v1/partner/facilities/MF00632 \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+  </Step>
+  <Step title="Check CBHI eligibility">
+    For a household.
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/eligibility/check \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{"scheme":"CBHI","householdHeadNationalId":"1197080098765432"}'
+    ```
+  </Step>
+</Steps>
+
+<Tip>
+  **Prefer to click?** Every endpoint is live in the [API Reference](/api-reference/introduction) — pick an operation, edit parameters, hit **Send**.
+</Tip>
+
+## Common flows
+
+<CardGroup cols={2}>
+  <Card title="Record a CBHI outpatient visit" icon="file-medical" href="/guides/use-cases/hospital-emr">
+    Eligibility → post visit (merged `services[]`) → gateway mints claim.
+  </Card>
+  <Card title="RAMA visit with hospital-written Rx" icon="prescription" href="/guides/use-cases/pharmacy-emr">
+    Post visit with `prescriptionDestination=PHARMACY` → any RAMA pharmacy fulfils by `memberId`.
+  </Card>
+  <Card title="RAMA inpatient admission" icon="bed-pulse" href="/guides/use-cases/hospital-emr">
+    Open admission → record daily services → discharge endpoint or auto-close after 30 days.
+  </Card>
+  <Card title="Rejected claim — resubmit" icon="rotate-left" href="/guides/getting-started/claim-lifecycle">
+    Receive `*.status-changed` webhook → fix cited lines → `POST /patient-visits/{ref}/resubmit`.
+  </Card>
+</CardGroup>

@@ -1,0 +1,82 @@
+---
+title: "Guides — build your integration in 4 steps"
+description: "Every partner ships faster by following the same path. Pick your role, then walk through the four-step loop that powers every Kwivuza integration."
+---
+
+<Info>
+  **The integration loop**
+  1. **Authenticate** — 2. **Check eligibility** — 3. **Record a visit** — 4. **Webhooks & status**
+</Info>
+
+## 1. Pick your role
+
+Each role ships a different integration. Pick yours for a step-by-step walkthrough.
+
+<CardGroup cols={3}>
+  <Card title="MOH E-Ubuzima" icon="building-columns" href="/guides/use-cases/moh-eubuzima">
+    **National dashboards · all facilities · CBHI + RAMA.** Single credential covering every facility nationwide. Best for cross-facility reporting, bulk ingestion, policy-level dashboards.
+  </Card>
+  <Card title="Hospital EMR" icon="hospital" href="/guides/use-cases/hospital-emr">
+    **Single facility · CBHI + RAMA.** One credential scoped to a single facility. Record visits for both schemes, write pharmacy e-prescriptions, transfer patients, submit pre-auths.
+  </Card>
+  <Card title="Pharmacy EMR" icon="pills" href="/guides/use-cases/pharmacy-emr">
+    **RAMA only · single pharmacy.** Fulfil hospital-written e-prescriptions, register paper prescriptions from outside the network. CBHI is hard-rejected.
+  </Card>
+</CardGroup>
+
+## Deep dives
+
+Topic-first guides for the v1.2 DTOs — read these when you hit a specific flow.
+
+<CardGroup cols={3}>
+  <Card title="Pharmacy items in services[]" icon="pills" href="/guides/use-cases/pharmacy-services">
+    How drugs and consumables flow inline in the merged `services[]`, and when to route them `FACILITY_DISPENSE` vs `PHARMACY` (system-wide e-Rx).
+  </Card>
+  <Card title="Pre-authorization & clinicalKnowledge" icon="stethoscope" href="/guides/use-cases/pre-authorization">
+    The plain-text `clinicalKnowledge` string, auto-opened pre-auths from `/patient-visits`, and per-line `pendingApprovalItems[]` reporting.
+  </Card>
+  <Card title="Paper prescriptions" icon="file-signature" href="/guides/use-cases/paper-prescription">
+    Register a prescription written outside Kwivuza — identify the prescriber by any unique facility code, dispense like any e-Rx.
+  </Card>
+</CardGroup>
+
+## 2. Learn the four-step integration loop
+
+Every partner integration ships in the same shape. Read these short concept pages before you write code — then keep them open as reference.
+
+<CardGroup cols={2}>
+  <Card title="1. Authentication" icon="key" href="/guides/getting-started/authentication">
+    Exchange a `serviceName` + `serviceSecret` for a Bearer JWT. Scopes on the token enforce which facilities, schemes, and endpoints you can use.
+  </Card>
+  <Card title="2. Environments" icon="globe" href="/guides/getting-started/environments">
+    Four tiers: local mock, sandbox, staging, production. Know which base URL to call and which secret manager to pull from.
+  </Card>
+  <Card title="3. The scheme field" icon="code-branch" href="/guides/getting-started/scheme-field">
+    One top-level field — `CBHI` or `RAMA` — routes every multi-scheme request to the right backend and the right business rules.
+  </Card>
+  <Card title="4. Alternate lookup keys" icon="key-skeleton" href="/guides/getting-started/lookup-keys">
+    Search facilities by FOSA, TIN, matricule or name; practitioners by licence, NID or phone. Kwivuza resolves any key you already hold.
+  </Card>
+  <Card title="5. Errors & codes" icon="triangle-exclamation" href="/guides/getting-started/errors">
+    Every error uses the same envelope `{ error: { code, message, details } }`. Branch on `code`, never parse messages.
+  </Card>
+  <Card title="6. Claim lifecycle" icon="timeline" href="/guides/getting-started/claim-lifecycle">
+    Submitted → Under review → Approved or Rejected → Paid. Pull the timeline any time; resubmit after rejection with one call.
+  </Card>
+  <Card title="7. Webhooks" icon="bell" href="/guides/getting-started/webhooks">
+    Register an HTTPS endpoint, receive HMAC-signed event callbacks. At-least-once delivery with exponential-backoff retry.
+  </Card>
+</CardGroup>
+
+## 3. Try it live
+
+Every endpoint is live in the API Reference — pick an operation, edit parameters, hit **Send**.
+
+<CardGroup cols={2}>
+  <Card title="API Reference" icon="book-open" href="/api-reference/introduction">
+    Every endpoint, every request/response shape. Rendered from OpenAPI 3.1. Search, deep-link, copy curl.
+  </Card>
+  <Card title="Need help?" icon="envelope" href="mailto:integrations@kwivuza.rw">
+    Email the integrations team with your `serviceName`, the request you sent, the response you got, and what you expected. Production partners also have a shared Slack channel.
+  </Card>
+</CardGroup>

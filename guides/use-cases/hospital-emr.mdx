@@ -1,0 +1,209 @@
+---
+title: "Hospital EMR walkthrough"
+description: "A single-facility credential for a district or referral hospital — records CBHI and RAMA visits with the facility inferred from the session."
+---
+
+One credential scoped to a single facility — a district or referral hospital running its own EMR. Records visits for both CBHI and RAMA patients; the facility is inferred from the session, so individual calls never need to repeat the `fosaId`.
+
+<Note>**What you'll build** — A reception-to-webhook flow: check eligibility at check-in with a single `memberId`, post a unified in-patient/out-patient visit with every line (acts, labs, drugs, consumables) in one merged `services[]`, handle pre-auth with a `clinicalKnowledge` narrative, and track status via webhook. _**Time:** ~60 min end-to-end · **Scope:** `CBHI`+`RAMA`, single `fosaId` (session-bound), no pharmacy dispense_</Note>
+
+## Credential scope
+
+- **`allowedSchemes: ["CBHI", "RAMA"]`**
+- **`allowedFosaIds: ["30311017"]`** — a single facility. The session token embeds it, so clinical calls don't need to echo `fosaId`.
+- **`allowPharmacy: false`** — hospital pharmacies dispense under the pharmacy credential, not this one.
+
+<Tip>
+  **Facility inference.** Hospital and pharmacy credentials are bound to one facility. `fosaId` is _not_ required on `/patient-visits`, `/pre-authorizations`, etc. Only MOH E-Ubuzima — which acts across every FOSA — needs to supply it explicitly.
+</Tip>
+
+## Walkthrough — a mixed-scheme outpatient day
+
+<Steps>
+  <Step title="Authenticate (once per 8h)">
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/session \
+      -H 'Content-Type: application/json' \
+      -d '{"serviceName":"kibagabaga-emr","serviceSecret":"demo-hospital-secret-2"}'
+    ```
+  </Step>
+  <Step title="CBHI patient at reception — check eligibility with one memberId">
+    Pass whichever identifier is printed on the card or held in the EMR — LODA number, household code, NID, or member number. The gateway resolves it against every supported CBHI key.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/eligibility/check \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{ "scheme": "CBHI", "memberId": "LODA-2024-0012345" }'
+    ```
+  </Step>
+  <Step title="RAMA patient at reception">
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/eligibility/check \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{ "scheme": "RAMA", "memberId": "MC-445566" }'
+    ```
+  </Step>
+  <Step title="Post a CBHI visit — unified in/out-patient shape">
+    The `/patient-visits` endpoint serves both OPD and IPD through `healthCareStayType`. Clinical services are a simple `{code, quantity}` list; there is no more `patient` wrapper or `patientType`. Include `partnerVisitId` for idempotency.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/patient-visits \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "scheme": "CBHI",
+        "practitionerLicenseNumber": "RMDC-12345",
+        "memberId": "1200870012345678",
+        "healthCareStayType": "OUT_PATIENT",
+        "admissionDate": "2026-04-20",
+        "diagnosisCodes": ["BA00"],
+        "services": [
+          { "code": "ACT-0100", "quantity": 1 },
+          { "code": "LAB-0201", "quantity": 1 }
+        ],
+        "partnerVisitId": "KBG-2026-04-20-0041"
+      }'
+    ```
+  </Step>
+  <Step title="Post a RAMA visit — same shape, different scheme">
+    Swap `scheme` and the `memberId`. Everything else is identical.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/patient-visits \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "scheme": "RAMA",
+        "practitionerLicenseNumber": "RMDC-12345",
+        "memberId": "RAMA-00045678",
+        "healthCareStayType": "OUT_PATIENT",
+        "admissionDate": "2026-04-20",
+        "diagnosisCodes": ["1E32"],
+        "services": [ { "code": "ACT-0100", "quantity": 1 } ]
+      }'
+    ```
+  </Step>
+  <Step title="Prescribe — acts, labs, drugs, consumables in one merged services[]">
+    In v1.2 every line lives directly in `services[]`. Drug lines carry the extra fields `frequency`, `durationDays`, `posology` (plus optional `customHours[]`); everything else just uses `quantity`. The top-level `prescriptionDestination` routes the drug lines:
+
+    | Destination | Who dispenses |
+    | --- | --- |
+    | `FACILITY_DISPENSE` (default) | Your own in-house pharmacy. No system-wide e-Rx is minted. |
+    | `PHARMACY` | Any RAMA-contracted pharmacy (RAMA only). An e-prescription is created; the patient picks it up anywhere. |
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/patient-visits \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "scheme": "RAMA",
+        "practitionerLicenseNumber": "RMDC-23456",
+        "memberId": "RAMA-00045678",
+        "healthCareStayType": "OUT_PATIENT",
+        "admissionDate": "2026-04-20",
+        "diagnosisCodes": ["BA00"],
+        "prescriptionDestination": "PHARMACY",
+        "services": [
+          { "code": "ACT-CONS-SPE", "quantity": 1 },
+          {
+            "code": "C09AA05",
+            "frequency": "QD",
+            "durationDays": 30,
+            "posology": "1 tablet in the morning"
+          }
+        ]
+      }'
+    ```
+
+    See the [pharmacy-items guide](/guides/use-cases/pharmacy-services) for the full field reference, consumables, and routing rules.
+  </Step>
+  <Step title="Transfer — refer to a higher-level facility">
+    Transfers are **facility → facility** only. Transfer to a pharmacy returns `TRANSFER_TO_PHARMACY_NOT_SUPPORTED` — that's what `prescriptionDestination=PHARMACY` is for. Omit `lines` to refer the whole visit.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/patient-visits/VST-20260420-0001/transfer \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{ "destinationFosaId": "DH0007", "motivation": "Requires specialist consultation" }'
+    ```
+  </Step>
+  <Step title="Reading the response — items carry unitPrice and amount, plus per-line pending approval">
+    Every item echoed back on the visit response has a `type` (enum `MEDICAL_ACT`, `LAB_EXAM`, `IMAGING`, `DRUG`, `CONSUMABLE`), a `unitPrice`, and a computed `amount` (integers, RWF). For drug lines, `amount = unitPrice × durationDays`; for every other line, `amount = unitPrice × quantity`. When a RAMA visit contains a product that requires medical-advisor review, the gateway accepts the visit and flags the specific lines in a `pendingApprovalItems[]` array — one entry per flagged line, with the submitted `code`, a machine `reason`, and an auto-opened `preAuthReference` you can poll or subscribe to.
+
+    ```json
+    {
+      "visitReference": "VST-R-20260420-0041",
+      "status": "PENDING_MEDICAL_ADVISOR_REVIEW",
+      "totalAmount": 185000,
+      "currency": "RWF",
+      "services": [
+        { "code": "ACT-CONS-SPE", "type": "MEDICAL_ACT", "quantity": 1,      "unitPrice": 8000,  "amount": 8000   },
+        { "code": "SRV-MRI",      "type": "IMAGING",     "quantity": 1,      "unitPrice": 150000,"amount": 150000 },
+        { "code": "L01XC02",      "type": "DRUG",        "durationDays": 30, "unitPrice": 900,   "amount": 27000  }
+      ],
+      "requireMedicalAdvisorApproval": true,
+      "pendingApprovalItems": [
+        {
+          "code": "SRV-MRI",
+          "status": "PENDING_MEDICAL_ADVISOR_APPROVAL",
+          "reason": "REQUIRES_PRE_AUTHORIZATION",
+          "preAuthReference": "PA-20260420-0013",
+          "message": "MRI requires medical-advisor approval before the study is performed."
+        },
+        {
+          "code": "L01XC02",
+          "status": "PENDING_MEDICAL_ADVISOR_APPROVAL",
+          "reason": "REQUIRES_PRE_AUTHORIZATION",
+          "preAuthReference": "PA-20260420-0014"
+        }
+      ]
+    }
+    ```
+
+    Display each item as "pending approval" in your EMR queue; do _not_ hold the whole visit behind a single opaque "pending" flag. Lines without an entry in `pendingApprovalItems[]` are approved and dispensable.
+  </Step>
+  <Step title="Pre-authorization — RAMA high-cost products">
+    Products flagged `requiresPreAuthorization:true` (CT, MRI, dialysis, surgery) need a medical advisor's sign-off. The request carries a `clinicalKnowledge` string — a plain-text clinical narrative (one or two paragraphs) the advisor reads.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/pre-authorizations \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "practitionerLicenseNumber": "RMDC-12345",
+        "memberId": "RAMA-00045678",
+        "diagnosisCodes": ["BA00"],
+        "products": [{ "code": "SRV-MRI", "quantity": 1 }],
+        "clinicalKnowledge": "45F with 3-week progressive right-sided headache and reduced grip strength. Exam: R-sided weakness, Babinski positive. Prior Paracetamol and NSAIDs ineffective. CT inconclusive. MRI requested to rule out intracranial mass before surgical planning. Urgency: URGENT."
+      }'
+    ```
+
+    Details: [pre-authorization guide](/guides/use-cases/pre-authorization).
+  </Step>
+  <Step title="Discharge an inpatient visit">
+    Only valid when `healthCareStayType=IN_PATIENT`. If you omit `daysStayed`, the backend computes it from admission → discharge.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/patient-visits/VST-20260418-0033/discharge \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{ "dischargeDate": "2026-04-21" }'
+    ```
+  </Step>
+  <Step title="Track status — subscribe to the status-changed webhook">
+    Subscribe to `cbhi.patient-visit.status-changed` / `rama.patient-visit.status-changed`, or poll `/status-history`. See the [claim-lifecycle guide](/guides/getting-started/claim-lifecycle).
+  </Step>
+</Steps>
+
+## What changed from v1.1
+
+- **Unified identifier.** No more `patient.memberNationalId` / `beneficiaryNumber` / `lodaNumber` per scheme — one `memberId` (or `patientId`) accepts every supported key.
+- **No `patientType`.** The gateway derives coverage type from the card lookup.
+- **Session-bound facility.** Hospital and pharmacy credentials don't need `fosaId` on clinical calls — MOH still does.
+- **Merged `services[]`.** One array carries every line — acts, labs, imaging, drugs, consumables. Drug lines add `frequency`, `durationDays`, `posology`. The old `pharmacyServices` block is gone.
+- **Top-level `prescriptionDestination`.** Promoted from the pharmacy block to the visit root.
+- **Response items carry `unitPrice`, `amount`, and `type`.** Integers in RWF; `amount` is computed.
+- **Pre-auth `clinicalKnowledge`.** Plain-text string — one or two paragraphs of clinical narrative for the medical advisor.
+- **Invoicing removed.** No monthly invoice or adjustment endpoints — lifecycle ends at "visit recorded → status updates via webhook".
+
+## Common errors
+
+- `FACILITY_NOT_IN_SCOPE` — posted `fosaId` isn't in the credential's scope (usually only happens if you passed one explicitly).
+- `PRACTITIONER_NOT_LICENSED_AT_FACILITY` — clinician has no active licence linked to the session facility.
+- `MEMBER_NOT_RESOLVED` — `memberId` didn't match any supported key for the scheme.
+- `MEDICAL_ADVISOR_APPROVAL_REQUIRED` — visit contains a pre-auth product; submit pre-auth first.
+- `PHARMACY_DESTINATION_NOT_ALLOWED_FOR_CBHI` — `prescriptionDestination=PHARMACY` is RAMA-only.

@@ -1,0 +1,79 @@
+{
+  "$schema": "https://mintlify.com/docs.json",
+  "theme": "mint",
+  "name": "Kwivuza Partner API",
+  "description": "One unified integration surface for partners sending and querying CBHI + RAMA claim data on Kwivuza.",
+  "colors": {
+    "primary": "#0D9373",
+    "light": "#22C55E",
+    "dark": "#0D9373"
+  },
+  "navbar": {
+    "links": [
+      {
+        "label": "Try it",
+        "href": "/api-reference/introduction"
+      }
+    ],
+    "primary": {
+      "type": "button",
+      "label": "Contact",
+      "href": "mailto:integrations@kwivuza.rw"
+    }
+  },
+  "footer": {
+    "socials": {
+      "website": "https://kwivuza.rw"
+    }
+  },
+  "navigation": {
+    "tabs": [
+      {
+        "tab": "Guides",
+        "groups": [
+          {
+            "group": "Overview",
+            "pages": ["index", "guides/index"]
+          },
+          {
+            "group": "Start here",
+            "pages": [
+              "guides/getting-started/authentication",
+              "guides/getting-started/environments",
+              "guides/getting-started/scheme-field"
+            ]
+          },
+          {
+            "group": "By role",
+            "pages": [
+              "guides/use-cases/moh-eubuzima",
+              "guides/use-cases/hospital-emr",
+              "guides/use-cases/pharmacy-emr"
+            ]
+          },
+          {
+            "group": "Deep dives",
+            "pages": [
+              "guides/use-cases/pharmacy-services",
+              "guides/use-cases/pre-authorization",
+              "guides/use-cases/paper-prescription"
+            ]
+          },
+          {
+            "group": "Core concepts",
+            "pages": [
+              "guides/getting-started/lookup-keys",
+              "guides/getting-started/errors",
+              "guides/getting-started/claim-lifecycle",
+              "guides/getting-started/webhooks"
+            ]
+          }
+        ]
+      },
+      {
+        "tab": "API Reference",
+        "openapi": "api-reference/openapi.yaml"
+      }
+    ]
+  }
+}

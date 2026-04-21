@@ -1,0 +1,2318 @@
+openapi: 3.1.0
+info:
+  title: Kwivuza Partner API
+  version: "1.2.0"
+  summary: External partner API for CBHI and RAMA claims, eligibility, and pharmacy dispensing.
+  description: |
+    The Kwivuza Partner API is the single integration surface for external systems
+    sending data to or querying data from Kwivuza — Rwanda's national CBHI and
+    RAMA claim-management platform.
+
+    **Three partner personas are supported:**
+
+    - **MOH E-Ubuzima** — a single credential covers all facilities across both schemes.
+    - **Individual Hospital EMR** — one credential scoped to a single facility (CBHI + RAMA).
+    - **Pharmacy EMR** — one credential scoped to a single pharmacy, RAMA only, with access to the voucher dispense flow.
+
+    **Design principles**
+    - Payloads use human-readable codes (`fosaId`, `practitionerLicenseNumber`,
+      `productCode`, ICD-11 `diagnosisCode`) — internal UUIDs are never exposed.
+    - Every multi-scheme endpoint accepts a top-level `scheme` field
+      (`"CBHI"` | `"RAMA"`). The gateway enforces scope against the JWT.
+    - **One identifier per patient.** All member/beneficiary lookups (eligibility,
+      patient visits, pharmacy flows, pre-authorizations) accept a single `memberId`
+      field — partners send whatever unique code they already hold (NID, passport,
+      household code, LODA number, beneficiary number, main card number, etc.) and the
+      gateway resolves it. `patientId` is accepted as an alias.
+    - **`fosaId` is only required for MOH E-Ubuzima.** Hospital EMR and pharmacy EMR
+      credentials are scoped to a single facility; the gateway infers the submitting
+      facility from the session and ignores any `fosaId` sent. MOH may still pass any
+      unique facility code (FOSA ID, Minisante matricule, supplier code, TIN, etc.).
+    - Errors use a single envelope: `{ error: { code, message, details[] } }`.
+  contact:
+    name: Kwivuza Integration Team
+    email: integrations@kwivuza.rw
+servers:
+  - url: http://localhost:4010
+    description: Local mock (seeded from mock/db/*.json — for Try-it and integration testing)
+  - url: https://gateway.kwivuza.rw
+    description: Production gateway
+tags:
+  - name: Authentication
+    description: Exchange partner credentials for a short-lived Bearer token.
+  - name: Facilities
+    description: Look up and search health facilities by FOSA ID, Minisante matricule, supplier code, TIN, or name.
+  - name: Practitioners
+    description: Look up, search, and register practitioners. Lookup accepts licence number, NID, passport, or phone.
+  - name: Reference Data
+    description: Diagnoses (ICD-11) and product tariff catalogue.
+  - name: Tariff
+    description: Submit facility-level tariff-update requests.
+  - name: Eligibility
+    description: Verify coverage. Payload is discriminated by `scheme`.
+  - name: Patient Visits
+    description: Record patient encounters (CBHI + RAMA).
+  - name: Pharmacy
+    description: |
+      RAMA-only. Three distinct pharmacy flows exist — choose based on the clinical scenario:
+
+      **Flow A — Walk-in pharmacy visit (no prior hospital prescriptions)**
+      Use when a RAMA beneficiary walks directly to a contracted pharmacy with a paper voucher.
+      1. `POST /pharmacy/open-vouchers` — open a voucher for the beneficiary.
+      2. `POST /pharmacy/dispenses` — dispense items against that voucher.
+
+      **Flow B — Hospital-written e-prescription fulfillment**
+      Use when a hospital recorded a visit with `prescriptionDestination: PHARMACY`.
+      The e-prescription is system-wide — any RAMA-contracted pharmacy can fill it by patient identifier.
+      1. `GET /pharmacy/prescriptions?memberId=…` — find pending e-prescriptions.
+      2. `POST /pharmacy/prescriptions/{ref}/fulfil` — dispense; partial fills are supported.
+
+      **Flow C — Hospital in-house pharmacy dispense**
+      When the hospital's own pharmacy dispenses, the hospital records the full visit (including pharmacy
+      dispense) via `POST /patient-visits` with `prescriptionDestination: FACILITY_DISPENSE`
+      (the default). No separate pharmacy call is needed.
+
+      **Flow D — Pharmacy EMR recording a paper prescription**
+      A pharmacy EMR may also record dispensing against a paper prescription written elsewhere by
+      calling `POST /patient-visits` with `prescribingFosaId` + `prescribingPractitionerLicenseNumber`
+      and the drugs listed in `services[]`.
+  - name: Claim Lifecycle
+    description: Post-submission claim actions — status history, resubmission after rejection, inpatient discharge.
+  - name: Transfers
+    description: Move a visit (or specific prescription lines) from one facility to another — e.g. hospital → pharmacy, health-centre → district hospital.
+  - name: Pharmacy Prescriptions
+    description: RAMA-only. Hospital-written prescriptions that any RAMA-contracted pharmacy can look up and fulfil.
+  - name: Pre-Authorizations
+    description: RAMA-only. Submit expensive-service requests for medical-advisor review before delivering care.
+  - name: Reason Codes
+    description: Stable enum catalogues for rejection, adjustment, and pre-authorization outcomes.
+  - name: Webhooks
+    description: Register HTTPS endpoints to receive signed event callbacks when claim state changes.
+security:
+  - bearerAuth: []
+paths:
+  /api/v1/partner/session:
+    post:
+      tags: [Authentication]
+      summary: Exchange credentials for a Bearer token
+      operationId: createSession
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/SessionRequest' }
+            examples:
+              moh:
+                summary: MOH E-Ubuzima
+                value: { serviceName: moh-eubuzima, serviceSecret: demo-moh-secret }
+              hospital:
+                summary: Hospital EMR
+                value: { serviceName: chuk-emr, serviceSecret: demo-hospital-secret }
+              pharmacy:
+                summary: Pharmacy EMR
+                value: { serviceName: conseil-pharmacy, serviceSecret: demo-pharmacy-secret }
+      responses:
+        '201':
+          description: Token issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/SessionResponse' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /api/v1/partner/facilities:
+    get:
+      tags: [Facilities]
+      summary: Search facilities
+      description: |
+        Partners can send any of these search keys via `query`:
+        `fosaId`, `matriculeMinisante`, `supplierCode`, `tin`, facility `name`,
+        or alternate names. Filters `district`, `level`, `type`, `ownership`,
+        and `scheme` narrow results.
+      operationId: listFacilities
+      parameters:
+        - in: query
+          name: query
+          schema: { type: string }
+          description: Free-text match on fosaId / matricule / supplier / TIN / name
+
+        - in: query
+          name: district
+          schema: { type: string }
+
+        - in: query
+          name: level
+          schema: { $ref: '#/components/schemas/FacilityLevel' }
+
+        - in: query
+          name: type
+          schema: { $ref: '#/components/schemas/FacilityType' }
+
+        - in: query
+          name: ownership
+          schema: { $ref: '#/components/schemas/FacilityOwnership' }
+
+        - in: query
+          name: scheme
+          schema: { $ref: '#/components/schemas/Scheme' }
+
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of facilities
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Facility' }
+
+  /api/v1/partner/facilities/{code}:
+    get:
+      tags: [Facilities]
+      summary: Get a facility by any of its codes
+      description: |
+        `code` may be the facility's `fosaId`, `matriculeMinisante`, `supplierCode`, or `tin`.
+      operationId: getFacility
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+          examples:
+            fosa: { value: MF00632, summary: FOSA ID }
+            minisante: { value: MINISANTE-30311017, summary: Minisante matricule }
+            supplier: { value: SUP-0045, summary: Supplier code }
+            tin: { value: "101234567", summary: TIN }
+      responses:
+        '200':
+          description: Facility
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Facility' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/practitioners:
+    get:
+      tags: [Practitioners]
+      summary: Search practitioners
+      description: |
+        `query` matches against `licenseNumber`, any alternate licence, `nationalId`, `passportNumber`,
+        `phoneNumber`, `email`, or full name.
+      operationId: listPractitioners
+      parameters:
+        - in: query
+          name: query
+          schema: { type: string }
+
+        - in: query
+          name: typeCode
+          schema: { type: string }
+          description: Category or sub-category code
+
+        - in: query
+          name: fosaId
+          schema: { type: string }
+          description: Filter by facility assignment
+
+        - in: query
+          name: status
+          schema: { type: string, enum: [ACTIVE, DISABLED] }
+
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of practitioners
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Practitioner' }
+    post:
+      tags: [Practitioners]
+      summary: Register a practitioner (local or foreign)
+      description: |
+        Body is a discriminated union on `identityType`:
+        - `NATIONAL_ID` → requires `nationalId`
+        - `PASSPORT` → requires `passportNumber`, `firstName`, `lastName`, `dateOfBirth`, `gender`
+      operationId: registerPractitioner
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PractitionerRegistration' }
+            examples:
+              local:
+                summary: Local practitioner (NID)
+                value:
+                  identityType: NATIONAL_ID
+                  licenseNumber: RMDC-99001
+                  nationalId: "1199987000001234"
+                  phoneNumber: "0788999001"
+                  fosaId: "30311017"
+                  typeCode: MEDICAL_DOCTOR
+                  subTypeCode: GENERAL_PRACTITIONER
+                  contractType: FULL_TIME
+              foreign:
+                summary: Foreign practitioner (passport)
+                value:
+                  identityType: PASSPORT
+                  licenseNumber: RMDC-F-99002
+                  passportNumber: X1234567
+                  firstName: Ana
+                  lastName: Silva
+                  gender: FEMALE
+                  dateOfBirth: "1985-02-10"
+                  phoneNumber: "0788999002"
+                  fosaId: "50210045"
+                  typeCode: MEDICAL_DOCTOR
+                  subTypeCode: SPECIALIST_SURGERY
+                  contractType: PART_TIME
+      responses:
+        '201':
+          description: Registered
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  licenseNumber: { type: string }
+                  status: { type: string, enum: [ACTIVE] }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/partner/practitioners/types:
+    get:
+      tags: [Practitioners]
+      summary: Enumerate practitioner categories and sub-categories
+      operationId: listPractitionerTypes
+      parameters:
+        - in: query
+          name: parentTypeCode
+          schema: { type: string }
+
+        - in: query
+          name: serviceLevel
+          schema: { type: string, enum: [MEDICALIZED, NON_MEDICALIZED] }
+
+        - in: query
+          name: type
+          schema: { type: string, enum: [CATEGORY, SUB_CATEGORY] }
+
+      responses:
+        '200':
+          description: Types
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PractitionerType' }
+
+  /api/v1/partner/practitioners/{code}:
+    get:
+      tags: [Practitioners]
+      summary: Get a practitioner by any of its codes
+      description: |
+        `code` may be `licenseNumber`, any alternate licence, `nationalId`,
+        `passportNumber`, or `phoneNumber`.
+      operationId: getPractitioner
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+          examples:
+            license: { value: RMDC-12345, summary: Licence number }
+            nid: { value: "1198780012345678", summary: National ID }
+            passport: { value: K45678912, summary: Passport }
+            phone: { value: "0788111111", summary: Phone }
+      responses:
+        '200':
+          description: Practitioner
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Practitioner' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/diagnoses:
+    get:
+      tags: [Reference Data]
+      summary: Search diagnoses (ICD-11 or legacy ICD-10)
+      description: |
+        `query` matches against `diagnosisCode` (ICD-11), `icd10Code`, diagnosis `name`, or common synonyms.
+      operationId: listDiagnoses
+      parameters:
+        - in: query
+          name: query
+          schema: { type: string }
+
+          examples:
+            icd11: { value: "1F42", summary: ICD-11 prefix }
+            icd10: { value: "B50.9", summary: ICD-10 }
+            name: { value: malaria, summary: Common name }
+        - in: query
+          name: chapter
+          schema: { type: string }
+
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of diagnoses
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Diagnosis' }
+
+  /api/v1/partner/diagnoses/{code}:
+    get:
+      tags: [Reference Data]
+      summary: Get a diagnosis by ICD-11 or ICD-10 code
+      operationId: getDiagnosis
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+
+      responses:
+        '200':
+          description: Diagnosis
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Diagnosis' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/products:
+    get:
+      tags: [Reference Data]
+      summary: Search product tariff catalogue
+      description: |
+        `query` matches `productCode`, any alternate code, ATC code, brand or generic name.
+        Filter by `scheme` (prices differ) and `type` (`DRUG`, `CONSUMABLE`, `MEDICAL_ACT`).
+      operationId: listProducts
+      parameters:
+        - in: query
+          name: query
+          schema: { type: string }
+
+          examples:
+            productCode: { value: N02BE0102E, summary: Product code }
+            atc: { value: J05AF06, summary: ATC code }
+            alt: { value: PAR-500, summary: Alternate code }
+            name: { value: paracetamol, summary: Name }
+        - in: query
+          name: scheme
+          schema: { $ref: '#/components/schemas/Scheme' }
+
+        - in: query
+          name: type
+          schema: { type: string, enum: [DRUG, CONSUMABLE, MEDICAL_ACT] }
+
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Page of products
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Pagination'
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: '#/components/schemas/Product' }
+
+  /api/v1/partner/products/{code}:
+    get:
+      tags: [Reference Data]
+      summary: Get a product by `productCode`, alternate code, or ATC code
+      operationId: getProduct
+      parameters:
+        - in: path
+          name: code
+          required: true
+          schema: { type: string }
+
+      responses:
+        '200':
+          description: Product
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Product' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/tariff-update-requests:
+    post:
+      tags: [Tariff]
+      summary: Submit a facility tariff-update request
+      operationId: createTariffUpdateRequest
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TariffUpdateRequest' }
+            examples:
+              sample:
+                value:
+                  scheme: CBHI
+                  fosaId: "MF00632"
+                  deliveryDate: "2026-05-10"
+                  deliveryReferenceNumber: "DN-2026-0047"
+                  products:
+                    - { productCode: N02BE0102E, tariffUponDelivery: 18, quantity: 5000 }
+                    - { productCode: J01CA04, tariffUponDelivery: 50, quantity: 1200 }
+      responses:
+        '201':
+          description: Submitted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  referenceNumber: { type: string, example: TUR-ABC-0042 }
+                  status: { type: string, example: PENDING_REVIEW }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /api/v1/partner/tariff-update-requests/{referenceNumber}:
+    get:
+      tags: [Tariff]
+      summary: Get a tariff-update request by reference
+      operationId: getTariffUpdateRequest
+      parameters:
+        - in: path
+          name: referenceNumber
+          required: true
+          schema: { type: string }
+
+      responses:
+        '200':
+          description: Tariff update request
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/TariffUpdateRequest' }
+
+  /api/v1/partner/eligibility/check:
+    post:
+      tags: [Eligibility]
+      summary: Verify member or beneficiary eligibility
+      description: |
+        Discriminated on `scheme`. Each scheme accepts a single `memberId` (alias
+        `patientId`) — the gateway resolves whichever identifier the partner already holds.
+
+        - **CBHI**: `householdCode`, `householdHeadNationalId`, `lodaNumber`,
+          `memberNationalId`, or `memberNumber`.
+        - **RAMA**: `beneficiaryNumber`, `mainCardNumber`, `nationalId`, or `passportNumber`.
+      operationId: checkEligibility
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EligibilityRequest' }
+            examples:
+              cbhiByHeadNid:
+                summary: CBHI by household head NID
+                value: { scheme: CBHI, memberId: "1197080098765432" }
+              cbhiByMemberNid:
+                summary: CBHI by member NID
+                value: { scheme: CBHI, memberId: "1200580076543210" }
+              cbhiByHouseholdCode:
+                summary: CBHI by household code
+                value: { scheme: CBHI, memberId: HH-RW-0001 }
+              ramaByBenNumber:
+                summary: RAMA by beneficiary number
+                value: { scheme: RAMA, memberId: RAMA-00045678 }
+              ramaByNid:
+                summary: RAMA by NID
+                value: { scheme: RAMA, memberId: "1198580054321087" }
+              ramaByPassport:
+                summary: RAMA by passport (expatriate)
+                value: { scheme: RAMA, patientId: EU789456 }
+      responses:
+        '200':
+          description: Eligibility result
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EligibilityResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/patient-visits:
+    post:
+      tags: [Patient Visits]
+      summary: Record a patient visit (CBHI or RAMA)
+      description: |
+        Records a patient visit for CBHI or RAMA, out-patient or in-patient. Payload is
+        discriminated by `scheme`.
+
+        **Patient identity** — a single `memberId` field (alias `patientId`) accepts any
+        unique identifier the partner already holds. See `PatientVisitRequestBase.memberId`.
+
+        **Facility identity** — `fosaId` is only required for MOH E-Ubuzima. Hospital EMR
+        and pharmacy EMR credentials are scoped to a single facility; the gateway infers
+        `fosaId` from the session and ignores any value sent.
+
+        **Service lines** — everything the patient received goes into a single flat
+        `services[]` array. Each entry is `{ code, quantity, ... }`:
+        - For medical acts / lab / imaging / consumables, only `code` and `quantity` are required.
+        - For drugs, partners add the optional clinical fields `frequency`, `customHours[]`
+          (used when `frequency=CUSTOM_HOURS`), `durationDays`, and `posology`.
+        - A single top-level `prescriptionDestination` governs where prescribed drugs/consumables
+          are routed: `FACILITY_DISPENSE` (default — the submitting facility's pharmacy
+          dispenses) or `PHARMACY` (RAMA-only; creates a system-wide e-prescription any
+          RAMA-contracted pharmacy can fulfil).
+        - If `diagnosisCodes` is provided, at least one item in `services[]` is required,
+          and vice versa.
+
+        **Pharmacy-EMR paper-prescription recording** — when a pharmacy EMR records
+        dispensing against a paper prescription written elsewhere, include
+        `prescribingFosaId` and `prescribingPractitionerLicenseNumber` (each accepts any
+        unique code) and submit the drug/consumable lines under `services[]` only.
+
+        **RAMA-specific notes**
+        - `voucherNumber` is **required**. It is the physical paper code printed on the
+          patient's RAMA voucher booklet and serves as the primary linkage between the
+          eligibility check and the claim. The gateway maps this to the internal voucher
+          reference.
+        - `dispensingDate` defaults to today when omitted. Must be within 30 days of
+          `admissionDate` (`admissionDate + 30 days ≥ dispensingDate`).
+        - `patientWeight` is required when `treatmentForNewBorn: true`.
+        - `clinicalKnowledge` — supply by default when any prescribed product is flagged
+          `requiresPreAuthorization: true`. When that flag is set, the gateway returns
+          `requireMedicalAdvisorApproval: true`; the visit enters
+          `PENDING_MEDICAL_ADVISOR_REVIEW` status and prescriptions release once the medical
+          advisor approves.
+        - **In-patient auto-discharge:** RAMA automatically discharges in-patients
+          (`healthCareStayType: IN_PATIENT`) at the end of each calendar month. The current
+          visit is closed with status `PATIENT_DISCHARGED` and a new continuation visit is
+          opened for the following month. Listen to the
+          `rama.patient-visit.status-changed` webhook to reconcile.
+      operationId: createPatientVisit
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PatientVisitRequest' }
+            examples:
+              cbhiMoh:
+                summary: CBHI out-patient (MOH E-Ubuzima — fosaId required)
+                value:
+                  scheme: CBHI
+                  fosaId: "MF00632"
+                  practitionerLicenseNumber: RNMC-A1-34567
+                  memberId: "1200580076543210"
+                  healthCareStayType: OUT_PATIENT
+                  admissionDate: "2026-04-20"
+                  dischargeDate: "2026-04-20"
+                  diagnosisCodes: ["1F42.Z", "ME82.1"]
+                  prescriptionDestination: FACILITY_DISPENSE
+                  services:
+                    - { code: ACT-CONS-GP, quantity: 1 }
+                    - { code: ACT-LAB-MAL, quantity: 1 }
+                    - { code: N02BE0102E, quantity: 12, frequency: TID, durationDays: 4, posology: "1 tablet three times a day after meals." }
+              cbhiHospitalEmr:
+                summary: CBHI in-patient (hospital EMR — fosaId inferred from session)
+                value:
+                  scheme: CBHI
+                  practitionerLicenseNumber: RNMC-A1-34567
+                  memberId: HH-RW-0001
+                  healthCareStayType: IN_PATIENT
+                  admissionDate: "2026-04-18"
+                  diagnosisCodes: ["BA00"]
+                  services:
+                    - { code: ACT-CONS-SPE, quantity: 2 }
+              ramaOutpatientHospital:
+                summary: RAMA out-patient (hospital in-house dispense)
+                value:
+                  scheme: RAMA
+                  practitionerLicenseNumber: RMDC-23456
+                  memberId: RAMA-00045678
+                  voucherNumber: "RW-2026-045678"
+                  healthCareStayType: OUT_PATIENT
+                  admissionDate: "2026-04-20"
+                  dispensingDate: "2026-04-20"
+                  diagnosisCodes: ["BA00"]
+                  prescriptionDestination: FACILITY_DISPENSE
+                  services:
+                    - { code: ACT-CONS-SPE, quantity: 1 }
+                    - { code: C09AA05, quantity: 30, frequency: QD, durationDays: 30, posology: "10mg once daily in the morning." }
+              ramaHospitalWithEPrescription:
+                summary: RAMA hospital visit — prescriptions for any pharmacy to fill
+                value:
+                  scheme: RAMA
+                  practitionerLicenseNumber: RMDC-23456
+                  memberId: RAMA-00045678
+                  voucherNumber: "RW-2026-045679"
+                  healthCareStayType: OUT_PATIENT
+                  admissionDate: "2026-04-20"
+                  diagnosisCodes: ["1F42.Z"]
+                  prescriptionDestination: PHARMACY
+                  services:
+                    - { code: ACT-CONS-GP, quantity: 1 }
+                    - { code: N02BE0102E, quantity: 10, frequency: BID, durationDays: 5, posology: "500mg twice daily with food." }
+              ramaWithPreAuthProduct:
+                summary: RAMA visit containing a product requiring pre-authorization
+                value:
+                  scheme: RAMA
+                  practitionerLicenseNumber: RMDC-23456
+                  memberId: RAMA-00045678
+                  voucherNumber: "RW-2026-045681"
+                  healthCareStayType: OUT_PATIENT
+                  admissionDate: "2026-04-20"
+                  diagnosisCodes: ["2A00"]
+                  clinicalKnowledge: |
+                    55yo female, suspected metastatic disease. CT requested to stage before oncology referral.
+                    No prior imaging in the last 12 months.
+                  services:
+                    - { code: ACT-IMG-CT, quantity: 1 }
+              ramaPharmacyPaperPrescription:
+                summary: Pharmacy EMR recording dispensing against a paper prescription
+                value:
+                  scheme: RAMA
+                  practitionerLicenseNumber: RMDC-23456
+                  memberId: RAMA-00045678
+                  voucherNumber: "RW-2026-045682"
+                  prescribingFosaId: "30311017"
+                  prescribingPractitionerLicenseNumber: RMDC-23456
+                  healthCareStayType: OUT_PATIENT
+                  admissionDate: "2026-04-20"
+                  dispensingDate: "2026-04-21"
+                  diagnosisCodes: ["1F42.Z"]
+                  prescriptionDestination: FACILITY_DISPENSE
+                  services:
+                    - { code: C09AA05, quantity: 30, frequency: QD, durationDays: 30, posology: "10mg once daily in the morning." }
+                    - { code: A10BA02, quantity: 60, frequency: BID, durationDays: 30, posology: "500mg twice daily with meals." }
+      responses:
+        '201':
+          description: Visit recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientVisitResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /api/v1/partner/patient-visits/{visitReference}:
+    get:
+      tags: [Patient Visits]
+      summary: Get a visit by its reference
+      operationId: getPatientVisit
+      parameters:
+        - in: path
+          name: visitReference
+          required: true
+          schema: { type: string }
+
+      responses:
+        '200':
+          description: Visit
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientVisit' }
+
+  /api/v1/partner/pharmacy/open-vouchers:
+    post:
+      tags: [Pharmacy]
+      summary: Open a RAMA pharmacy voucher
+      description: Pharmacy partners only. Rejects CBHI.
+      operationId: openVoucher
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/OpenVoucherRequest' }
+            examples:
+              byBenNumber:
+                value: { memberId: RAMA-00045678 }
+              byNid:
+                value: { memberId: "1198580054321087" }
+              byPassport:
+                value: { patientId: EU789456 }
+              mohExplicitFosa:
+                summary: MOH E-Ubuzima must supply fosaId
+                value: { fosaId: PH0101, memberId: RAMA-00045678 }
+      responses:
+        '201':
+          description: Voucher opened
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Voucher' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/partner/pharmacy/dispenses:
+    post:
+      tags: [Pharmacy]
+      summary: Dispense items against an open voucher
+      operationId: dispenseVoucher
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DispenseRequest' }
+            examples:
+              sample:
+                value:
+                  voucherReference: VCH-ABC-0001
+                  items:
+                    - { productCode: C09AA05, quantity: 30, durationDays: 30 }
+                    - { productCode: A10BA02, quantity: 60, durationDays: 30 }
+      responses:
+        '201':
+          description: Dispensed
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispenseResponse' }
+        '409': { $ref: '#/components/responses/Conflict' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+
+  /api/v1/partner/pharmacy/vouchers/{voucherReference}:
+    get:
+      tags: [Pharmacy]
+      summary: Get a voucher by reference
+      operationId: getVoucher
+      parameters:
+        - in: path
+          name: voucherReference
+          required: true
+          schema: { type: string }
+
+      responses:
+        '200':
+          description: Voucher
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Voucher' }
+
+  /api/v1/partner/patient-visits/{visitReference}/status-history:
+    get:
+      tags: [Claim Lifecycle]
+      summary: Get visit status history
+      description: Returns the chronological state timeline of a patient visit. Each entry carries the state code, actor (partner service or internal role), an optional rejection/adjustment reason code, and a free-text comment.
+      operationId: getPatientVisitStatusHistory
+      parameters:
+        - in: path
+          name: visitReference
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Timeline of status changes
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  visitReference: { type: string }
+                  statusHistory:
+                    type: array
+                    items: { $ref: '#/components/schemas/StatusHistoryEntry' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/patient-visits/{visitReference}/resubmit:
+    post:
+      tags: [Claim Lifecycle]
+      summary: Resubmit a rejected visit
+      description: |
+        Available only when the visit is in a `REJECTED` state. Submit a diff of corrected
+        fields (updated diagnoses, services, supporting documents) and a `reasonForResubmission`.
+        The backend appends a `RESUBMITTED` status entry and re-enters the adjudication queue.
+      operationId: resubmitPatientVisit
+      parameters:
+        - in: path
+          name: visitReference
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ResubmitRequest' }
+      responses:
+        '200':
+          description: Resubmission accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientVisit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/partner/patient-visits/{visitReference}/discharge:
+    post:
+      tags: [Claim Lifecycle]
+      summary: Discharge an inpatient visit
+      description: Closes an inpatient visit and recomputes bed-day billing. Only valid when `healthCareStayType=IN_PATIENT`. `daysStayed` is computed from admission → discharge dates if omitted.
+      operationId: dischargePatientVisit
+      parameters:
+        - in: path
+          name: visitReference
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/DischargeRequest' }
+      responses:
+        '200':
+          description: Visit discharged
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PatientVisit' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/partner/patient-visits/{visitReference}/transfer:
+    post:
+      tags: [Transfers]
+      summary: Transfer a visit (or prescription lines) to another facility
+      description: |
+        Initiate a transfer to a destination facility. Two common shapes:
+
+        - **Hospital → pharmacy (RAMA)** — pass `lines[]` referencing drug/consumable
+          product codes the destination pharmacy should dispense.
+        - **Facility → facility (CBHI or RAMA referral)** — omit `lines[]` to transfer
+          continuation-of-care for the full visit.
+
+        The gateway validates the destination supports the visit's `scheme`. For pharmacy
+        destinations on RAMA, each line must match an outstanding prescription with
+        sufficient remaining quantity.
+      operationId: createTransfer
+      parameters:
+        - in: path
+          name: visitReference
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/TransferRequest' }
+      responses:
+        '201':
+          description: Transfer created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '422': { $ref: '#/components/responses/UnprocessableEntity' }
+
+  /api/v1/partner/patient-visits/transfers/inbound:
+    get:
+      tags: [Transfers]
+      summary: List inbound transfers
+      description: Returns transfers addressed to the calling partner's facility scope. Filter by `memberKey` to find transfers for a specific patient presenting at the counter.
+      operationId: listInboundTransfers
+      parameters:
+        - in: query
+          name: fosaId
+          schema: { type: string }
+          description: Destination facility; defaults to the caller's scope.
+        - in: query
+          name: memberKey
+          schema: { type: string }
+          description: Beneficiary number, main card number, or national ID.
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING_ACCEPTANCE, ACCEPTED, CANCELLED] }
+      responses:
+        '200':
+          description: Inbound transfers
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Transfer' }
+
+  /api/v1/partner/patient-visits/transfers/{transferReference}/accept:
+    post:
+      tags: [Transfers]
+      summary: Accept a transfer
+      description: |
+        Destination facility marks the transfer `ACCEPTED`. For RAMA pharmacy destinations,
+        the accept call also auto-creates a `DISPENSED` voucher and updates the linked
+        prescription status — collapsing transfer-accept and dispense into a single
+        counter-side operation.
+      operationId: acceptTransfer
+      parameters:
+        - in: path
+          name: transferReference
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Transfer accepted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Transfer' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/partner/pharmacy/prescriptions:
+    get:
+      tags: [Pharmacy Prescriptions]
+      summary: List hospital-written prescriptions for a beneficiary
+      description: |
+        RAMA-only. The pharmacy passes a single `memberId` (beneficiary number, main card
+        number, NID, or passport) and receives all prescriptions written by any
+        RAMA-contracted hospital that are available to fulfil. Defaults to
+        `status=PENDING_DISPENSING`.
+      operationId: listPharmacyPrescriptions
+      parameters:
+        - in: query
+          name: memberId
+          schema: { type: string }
+          description: Any unique identifier the pharmacy holds for the RAMA beneficiary. Alias `patientId`.
+        - in: query
+          name: patientId
+          schema: { type: string }
+          description: Alias for `memberId`.
+        - in: query
+          name: fosaId
+          schema: { type: string }
+          description: Filter to prescriptions written at a specific facility.
+        - in: query
+          name: status
+          schema: { type: string, enum: [PENDING_DISPENSING, PARTIALLY_DISPENSED, DISPENSED, TRANSFERRED, CANCELLED, EXPIRED] }
+      responses:
+        '200':
+          description: Prescriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/PharmacyPrescription' }
+        '403':
+          description: Caller's scheme scope does not include RAMA (`PHARMACY_DISPENSE_NOT_ALLOWED_FOR_CBHI`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+
+  /api/v1/partner/pharmacy/prescriptions/{prescriptionReference}:
+    get:
+      tags: [Pharmacy Prescriptions]
+      summary: Get a prescription
+      operationId: getPharmacyPrescription
+      parameters:
+        - in: path
+          name: prescriptionReference
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Prescription detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PharmacyPrescription' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/pharmacy/prescriptions/{prescriptionReference}/fulfil:
+    post:
+      tags: [Pharmacy Prescriptions]
+      summary: Fulfil a hospital-written prescription
+      description: |
+        Creates a voucher and records dispensing in a single call. Partial fills are
+        supported: pass a `quantity` ≤ the prescribed quantity and the prescription
+        remains `PARTIALLY_DISPENSED` until the remainder is filled.
+      operationId: fulfilPharmacyPrescription
+      parameters:
+        - in: path
+          name: prescriptionReference
+          required: true
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/FulfilPrescriptionRequest' }
+      responses:
+        '201':
+          description: Prescription fulfilled; voucher created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/DispenseResponse' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409': { $ref: '#/components/responses/Conflict' }
+
+  /api/v1/partner/pre-authorizations:
+    post:
+      tags: [Pre-Authorizations]
+      summary: Submit a pre-authorization request
+      description: |
+        RAMA-only. Products flagged `requiresPreAuthorization: true` (CT scan, MRI,
+        dialysis, surgery, expensive oncology drugs, etc.) must be pre-authorized by a
+        medical advisor before care is delivered. Returns an outcome drawn from the
+        `preauth` reason-code catalogue.
+      operationId: createPreAuthorization
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PreAuthorizationRequest' }
+      responses:
+        '201':
+          description: Pre-authorization recorded
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PreAuthorization' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '403':
+          description: Caller's scope does not include RAMA (`PREAUTH_RAMA_ONLY`).
+          content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+
+  /api/v1/partner/pre-authorizations/{preauthReference}:
+    get:
+      tags: [Pre-Authorizations]
+      summary: Get a pre-authorization
+      operationId: getPreAuthorization
+      parameters:
+        - in: path
+          name: preauthReference
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Pre-authorization detail
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PreAuthorization' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/reason-codes:
+    get:
+      tags: [Reason Codes]
+      summary: Get the reason-code catalogue
+      description: Stable enum catalogue. Use `domain=rejection` for visit-level rejections, and `domain=preauth` for pre-authorization outcomes. Omit `domain` to get both.
+      operationId: listReasonCodes
+      parameters:
+        - in: query
+          name: domain
+          schema: { type: string, enum: [rejection, preauth] }
+      responses:
+        '200':
+          description: Catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties:
+                  type: array
+                  items: { $ref: '#/components/schemas/ReasonCode' }
+
+  /api/v1/partner/webhooks:
+    post:
+      tags: [Webhooks]
+      summary: Register a webhook subscription
+      description: |
+        Register an HTTPS endpoint to receive signed event callbacks. The response
+        includes a `secret` — store it and use it to verify the `X-Kwivuza-Signature`
+        HMAC-SHA256 header on each delivery. Rotate the secret by deleting and
+        re-creating the subscription.
+      operationId: createWebhookSubscription
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WebhookSubscriptionRequest' }
+      responses:
+        '201':
+          description: Subscription created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/WebhookSubscription' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    get:
+      tags: [Webhooks]
+      summary: List webhook subscriptions
+      operationId: listWebhookSubscriptions
+      responses:
+        '200':
+          description: Subscriptions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookSubscription' }
+
+  /api/v1/partner/webhooks/{id}:
+    delete:
+      tags: [Webhooks]
+      summary: Delete a webhook subscription
+      operationId: deleteWebhookSubscription
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+      responses:
+        '204': { description: Deleted }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /api/v1/partner/webhooks/{id}/deliveries:
+    get:
+      tags: [Webhooks]
+      summary: List webhook delivery attempts
+      operationId: listWebhookDeliveries
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema: { type: string }
+        - $ref: '#/components/parameters/Page'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: Delivery log
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookDelivery' }
+
+  /api/v1/partner/webhooks/events:
+    get:
+      tags: [Webhooks]
+      summary: List available event types
+      description: |
+        Returns the catalogue of event names a subscription can listen to. The v1.2
+        catalogue is exactly six events:
+
+        - `cbhi.patient-visit.created`
+        - `cbhi.patient-visit.status-changed`
+        - `rama.patient-visit.created`
+        - `rama.patient-visit.status-changed`
+        - `rama.voucher.dispensed`
+        - `rama.preauth.decided`
+      operationId: listWebhookEvents
+      responses:
+        '200':
+          description: Event catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  events:
+                    type: array
+                    items: { $ref: '#/components/schemas/WebhookEvent' }
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+  parameters:
+    Page:
+      in: query
+      name: page
+      schema: { type: integer, minimum: 1, default: 1 }
+    Limit:
+      in: query
+      name: limit
+      schema: { type: integer, minimum: 1, maximum: 200, default: 20 }
+  responses:
+    Unauthorized:
+      description: Missing or invalid token
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Forbidden:
+      description: Scheme or facility out of scope
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    BadRequest:
+      description: Validation error
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    NotFound:
+      description: Resource not found
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    Conflict:
+      description: Conflicting state (e.g. voucher already dispensed)
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+    UnprocessableEntity:
+      description: One or more items invalid
+      content: { application/json: { schema: { $ref: '#/components/schemas/ErrorEnvelope' } } }
+  schemas:
+    Scheme:
+      type: string
+      enum: [CBHI, RAMA]
+    FacilityType:
+      type: string
+      enum: [HOSPITAL, HEALTH_CENTER, HEALTH_POST, PHARMACY, CLINIC, AMBULANCE]
+    FacilityLevel:
+      type: string
+      enum: [REFERRAL_HOSPITAL, DISTRICT_HOSPITAL, HEALTH_CENTER, HEALTH_POST, PHARMACY]
+    FacilityOwnership:
+      type: string
+      enum: [PUBLIC, PRIVATE, FAITH_BASED]
+    ErrorEnvelope:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code: { type: string, example: FACILITY_NOT_FOUND }
+            message: { type: string, example: No facility matches code XYZ }
+            details: { type: array, items: { type: object } }
+    Pagination:
+      type: object
+      properties:
+        pagination:
+          type: object
+          properties:
+            page: { type: integer }
+            limit: { type: integer }
+            total: { type: integer }
+            totalPages: { type: integer }
+    SessionRequest:
+      type: object
+      required: [serviceName, serviceSecret]
+      properties:
+        serviceName: { type: string }
+        serviceSecret: { type: string }
+    SessionResponse:
+      type: object
+      properties:
+        token: { type: string }
+        expiresAt: { type: string, format: date-time }
+        partner:
+          type: object
+          properties:
+            serviceName: { type: string }
+            partnerType: { type: string, enum: [MOH_EUBUZIMA, HOSPITAL_EMR, PHARMACY_EMR] }
+            displayName: { type: string }
+            allowedSchemes:
+              type: array
+              items: { $ref: '#/components/schemas/Scheme' }
+            allowedFosaIds:
+              oneOf:
+                - { type: string, enum: ['*'] }
+                - { type: array, items: { type: string } }
+            allowPharmacy: { type: boolean }
+    Facility:
+      type: object
+      properties:
+        fosaId: { type: string, example: MF00632 }
+        matriculeMinisante: { type: string }
+        supplierCode: { type: string }
+        tin: { type: string }
+        name: { type: string }
+        alternateNames: { type: array, items: { type: string } }
+        type: { $ref: '#/components/schemas/FacilityType' }
+        category: { type: string }
+        ownership: { $ref: '#/components/schemas/FacilityOwnership' }
+        level: { $ref: '#/components/schemas/FacilityLevel' }
+        phone: { type: string }
+        email: { type: string, format: email }
+        schemes:
+          type: array
+          items: { $ref: '#/components/schemas/Scheme' }
+        location:
+          type: object
+          properties:
+            province: { type: string }
+            district: { type: string }
+            sector: { type: string }
+            cell: { type: string }
+            village: { type: string }
+            villageCode: { type: string }
+        contractStartDate: { type: string, format: date }
+        contractEndDate: { type: string, format: date, nullable: true }
+        status: { type: string, enum: [ACTIVE, SUSPENDED, TERMINATED] }
+    PractitionerType:
+      type: object
+      properties:
+        typeCode: { type: string }
+        label: { type: string }
+        type: { type: string, enum: [CATEGORY, SUB_CATEGORY] }
+        parentTypeCode: { type: string, nullable: true }
+        serviceLevel: { type: string, enum: [MEDICALIZED, NON_MEDICALIZED] }
+    Practitioner:
+      type: object
+      properties:
+        licenseNumber: { type: string }
+        alternateLicenseNumbers: { type: array, items: { type: string } }
+        nationalId: { type: string, nullable: true }
+        passportNumber: { type: string, nullable: true }
+        phoneNumber: { type: string }
+        email: { type: string, nullable: true }
+        firstName: { type: string }
+        lastName: { type: string }
+        gender: { type: string, enum: [MALE, FEMALE] }
+        dateOfBirth: { type: string, format: date }
+        typeCode: { type: string }
+        subTypeCode: { type: string, nullable: true }
+        serviceLevel: { type: string, enum: [MEDICALIZED, NON_MEDICALIZED] }
+        contractType: { type: string, enum: [PART_TIME, FULL_TIME] }
+        status: { type: string, enum: [ACTIVE, DISABLED] }
+        facilities:
+          type: array
+          items:
+            type: object
+            properties:
+              fosaId: { type: string }
+              status: { type: string }
+              startDate: { type: string, format: date }
+              endDate: { type: string, format: date, nullable: true }
+    PractitionerRegistration:
+      oneOf:
+        - $ref: '#/components/schemas/PractitionerRegistrationLocal'
+        - $ref: '#/components/schemas/PractitionerRegistrationForeign'
+      discriminator:
+        propertyName: identityType
+        mapping:
+          NATIONAL_ID: '#/components/schemas/PractitionerRegistrationLocal'
+          PASSPORT: '#/components/schemas/PractitionerRegistrationForeign'
+    PractitionerRegistrationLocal:
+      type: object
+      required: [identityType, licenseNumber, nationalId, phoneNumber, fosaId, typeCode, contractType]
+      properties:
+        identityType: { type: string, enum: [NATIONAL_ID] }
+        licenseNumber: { type: string }
+        alternateLicenseNumbers: { type: array, items: { type: string } }
+        nationalId: { type: string, pattern: '^\d{16}$' }
+        phoneNumber: { type: string, example: "0788123456" }
+        email: { type: string, format: email }
+        fosaId: { type: string }
+        typeCode: { type: string }
+        subTypeCode: { type: string }
+        contractType: { type: string, enum: [PART_TIME, FULL_TIME] }
+    PractitionerRegistrationForeign:
+      type: object
+      required: [identityType, licenseNumber, passportNumber, firstName, lastName, gender, dateOfBirth, phoneNumber, fosaId, typeCode, contractType]
+      properties:
+        identityType: { type: string, enum: [PASSPORT] }
+        licenseNumber: { type: string }
+        passportNumber: { type: string }
+        firstName: { type: string }
+        lastName: { type: string }
+        gender: { type: string, enum: [MALE, FEMALE] }
+        dateOfBirth: { type: string, format: date }
+        phoneNumber: { type: string }
+        email: { type: string, format: email }
+        fosaId: { type: string }
+        typeCode: { type: string }
+        subTypeCode: { type: string }
+        contractType: { type: string, enum: [PART_TIME, FULL_TIME] }
+    Diagnosis:
+      type: object
+      properties:
+        diagnosisCode: { type: string, example: "1F42.Z" }
+        icd10Code: { type: string, example: "B50.9" }
+        name: { type: string }
+        alternateNames: { type: array, items: { type: string } }
+        chapter: { type: string }
+    Product:
+      type: object
+      properties:
+        productCode: { type: string }
+        alternateCodes: { type: array, items: { type: string } }
+        atcCode: { type: string, nullable: true }
+        name: { type: string }
+        alternateNames: { type: array, items: { type: string } }
+        genericName: { type: string, nullable: true }
+        type: { type: string, enum: [DRUG, CONSUMABLE, MEDICAL_ACT] }
+        dosageForm: { type: string, nullable: true }
+        strength: { type: string, nullable: true }
+        unitOfMeasure: { type: string }
+        schemes: { type: array, items: { $ref: '#/components/schemas/Scheme' } }
+        unitPrice:
+          type: object
+          additionalProperties: { type: number }
+          example: { CBHI: 15, RAMA: 20 }
+        currency: { type: string, example: RWF }
+        active: { type: boolean }
+    TariffUpdateRequest:
+      type: object
+      required: [scheme, fosaId, deliveryDate, products]
+      properties:
+        scheme: { $ref: '#/components/schemas/Scheme' }
+        fosaId: { type: string }
+        deliveryDate: { type: string, format: date }
+        deliveryReferenceNumber: { type: string }
+        products:
+          type: array
+          items:
+            type: object
+            required: [productCode, tariffUponDelivery, quantity]
+            properties:
+              productCode: { type: string }
+              tariffUponDelivery: { type: number }
+              quantity: { type: integer }
+        referenceNumber: { type: string, readOnly: true }
+        status: { type: string, readOnly: true }
+    EligibilityRequest:
+      oneOf:
+        - $ref: '#/components/schemas/EligibilityRequestCBHI'
+        - $ref: '#/components/schemas/EligibilityRequestRAMA'
+      discriminator:
+        propertyName: scheme
+        mapping:
+          CBHI: '#/components/schemas/EligibilityRequestCBHI'
+          RAMA: '#/components/schemas/EligibilityRequestRAMA'
+    EligibilityRequestCBHI:
+      type: object
+      required: [scheme, memberId]
+      properties:
+        scheme: { type: string, enum: [CBHI] }
+        memberId:
+          type: string
+          description: |
+            Any unique identifier the partner already holds for the CBHI member or household —
+            `householdCode`, `householdHeadNationalId`, `lodaNumber`, `memberNationalId`, or
+            `memberNumber`. The gateway resolves which identifier was supplied and returns the
+            full household + member payload. Also accepted under the alias `patientId`.
+        patientId:
+          type: string
+          description: Alias for `memberId`. Accepted interchangeably.
+    EligibilityRequestRAMA:
+      type: object
+      required: [scheme, memberId]
+      properties:
+        scheme: { type: string, enum: [RAMA] }
+        memberId:
+          type: string
+          description: |
+            Any unique identifier the partner already holds for the RAMA beneficiary —
+            `beneficiaryNumber`, `mainCardNumber`, `nationalId`, or `passportNumber`.
+            The gateway resolves which identifier was supplied and returns the full beneficiary
+            payload. Also accepted under the alias `patientId`.
+        patientId:
+          type: string
+          description: Alias for `memberId`. Accepted interchangeably.
+    EligibilityResponse:
+      type: object
+      properties:
+        scheme: { $ref: '#/components/schemas/Scheme' }
+        eligible: { type: boolean }
+        reason: { type: string }
+        household: { type: object, additionalProperties: true }
+        member: { type: object, additionalProperties: true }
+        beneficiary: { type: object, additionalProperties: true }
+        dependents: { type: array, items: { type: object, additionalProperties: true } }
+    PatientVisitRequest:
+      oneOf:
+        - $ref: '#/components/schemas/PatientVisitRequestCBHI'
+        - $ref: '#/components/schemas/PatientVisitRequestRAMA'
+      discriminator:
+        propertyName: scheme
+        mapping:
+          CBHI: '#/components/schemas/PatientVisitRequestCBHI'
+          RAMA: '#/components/schemas/PatientVisitRequestRAMA'
+
+    PatientVisitRequestBase:
+      type: object
+      required: [scheme, practitionerLicenseNumber, memberId, healthCareStayType, admissionDate]
+      properties:
+        scheme: { $ref: '#/components/schemas/Scheme' }
+        fosaId:
+          type: string
+          description: |
+            Any unique code identifying the facility submitting the claim (FOSA ID,
+            Minisante matricule, supplier code, TIN, etc.). **Only required for MOH
+            E-Ubuzima** — individual hospital EMR and pharmacy EMR credentials are already
+            scoped to a single facility, so the gateway infers `fosaId` from the session
+            and ignores this field if sent.
+        practitionerLicenseNumber: { type: string }
+        memberId:
+          type: string
+          description: |
+            Any unique identifier the partner already holds for the patient (CBHI or RAMA).
+            The gateway resolves which identifier was supplied and links the visit to the
+            correct member/beneficiary.
+
+            - **CBHI** accepts: `memberNationalId`, `memberNumber`, `householdCode`,
+              `householdHeadNationalId`, or `lodaNumber`.
+            - **RAMA** accepts: `beneficiaryNumber`, `mainCardNumber`, `nationalId`, or
+              `passportNumber`.
+
+            Also accepted under the alias `patientId`.
+        patientId:
+          type: string
+          description: Alias for `memberId`. Accepted interchangeably.
+        patientPhoneNumber: { type: string }
+        healthCareStayType: { type: string, enum: [OUT_PATIENT, IN_PATIENT] }
+        admissionDate:
+          type: string
+          format: date
+          description: Date the patient was seen or admitted. For RAMA this is the treatment date.
+        dischargeDate:
+          type: string
+          format: date
+          nullable: true
+          description: "Required for IN_PATIENT when the patient leaves. May be submitted later via POST /patient-visits/{ref}/discharge."
+        treatmentForNewBorn:
+          type: boolean
+          description: Set to true for neonatal cases. When true patientWeight is required on RAMA.
+        patientWeight:
+          type: number
+          description: Patient weight in kg. Required on RAMA when treatmentForNewBorn is true.
+        diagnosisCodes:
+          type: array
+          items: { type: string }
+          description: ICD-11 codes. At least one is required when `services[]` is provided, and vice versa.
+        prescriptionDestination:
+          type: string
+          enum: [FACILITY_DISPENSE, PHARMACY]
+          default: FACILITY_DISPENSE
+          description: |
+            Top-level, single value — where any prescribed drugs or consumables in `services[]`
+            are routed after the visit is saved.
+            - `FACILITY_DISPENSE` (default) — the submitting facility's own pharmacy dispenses.
+              The visit is closed in a single call.
+            - `PHARMACY` — **RAMA-only.** Creates a system-wide e-prescription that any
+              RAMA-contracted pharmacy can look up via `GET /pharmacy/prescriptions` and
+              fulfil. Partial fills are supported.
+        services:
+          type: array
+          description: |
+            Every clinical item delivered during the visit — medical acts, lab tests, imaging,
+            consumables, and drugs — recorded in a single flat list. Drug lines add optional
+            clinical fields (`frequency`, `customHours[]`, `durationDays`, `posology`); medical
+            acts and lab/imaging lines only need `code` and `quantity`.
+
+            Used by:
+            - **Hospital EMRs** to record everything the patient received, including prescriptions
+              (routed to the in-house pharmacy by default, or to any RAMA-contracted pharmacy
+              when `prescriptionDestination: PHARMACY` is set at the top level).
+            - **Individual EMRs** to record acts and prescriptions they dispensed themselves.
+            - **Pharmacy EMRs** to record dispensing against a paper prescription written by
+              another facility (see `prescribingFosaId` / `prescribingPractitionerLicenseNumber`).
+          items:
+            type: object
+            required: [code, quantity]
+            properties:
+              code: { type: string, description: "Product code (medical act, lab exam, imaging, drug, or consumable)." }
+              quantity: { type: integer }
+              frequency:
+                $ref: '#/components/schemas/DrugAdministrationFrequency'
+                description: Drug lines only. Dosing frequency code.
+              customHours:
+                type: array
+                description: Drug lines only. Populated when `frequency=CUSTOM_HOURS`; list the exact clock times.
+                items: { type: string }
+              durationDays:
+                type: integer
+                description: Drug lines only. Number of days the course should last.
+              posology:
+                type: string
+                description: |
+                  Drug lines only. Free-text dosing regimen shown to the patient — what to
+                  take, when, and how. Example: "1 tablet in the morning, 1 tablet in the
+                  evening, take with food."
+        prescribingFosaId:
+          type: string
+          description: |
+            **Pharmacy-EMR paper-prescription recording only.** Any unique code identifying
+            the facility that wrote the paper prescription being dispensed
+            (FOSA ID, Minisante matricule, supplier code, TIN, etc.).
+        prescribingPractitionerLicenseNumber:
+          type: string
+          description: |
+            **Pharmacy-EMR paper-prescription recording only.** Any unique code identifying
+            the practitioner who wrote the paper prescription (licence number, alternate
+            licence, NID, passport, or phone).
+        clinicalKnowledge:
+          type: string
+          description: |
+            Plain-text clinical message for the medical advisor. Supply whenever any
+            submitted product is flagged `requiresPreAuthorization: true` in the catalogue
+            so the advisor has the clinical picture without a separate pre-auth call.
+          example: "55yo female with suspected metastatic disease. Requesting CT to stage before oncology referral. No prior imaging in the last 12 months."
+        referralReference:
+          type: string
+          description: If this visit follows an inbound referral (CBHI) or transfer (RAMA), carry that reference here.
+        supportingDocuments:
+          type: array
+          items: { $ref: '#/components/schemas/SupportingDocument' }
+
+    PatientVisitRequestCBHI:
+      allOf:
+        - $ref: '#/components/schemas/PatientVisitRequestBase'
+        - type: object
+          properties:
+            scheme: { type: string, enum: [CBHI] }
+          description: |
+            CBHI visit. The patient is identified by the single `memberId` field on the base
+            schema; no scheme-specific identifier fields are accepted.
+
+    PatientVisitRequestRAMA:
+      allOf:
+        - $ref: '#/components/schemas/PatientVisitRequestBase'
+        - type: object
+          required: [voucherNumber]
+          properties:
+            scheme: { type: string, enum: [RAMA] }
+            voucherNumber:
+              type: string
+              description: |
+                **Required for RAMA.** The physical paper code printed on the patient's RAMA voucher
+                booklet (e.g. `"RW-2026-045678"`). This code ties the eligibility check to the claim
+                and must match the booklet handed to the prescribing facility. The gateway maps this
+                to the internal voucher reference returned as `visitReference`.
+            dispensingDate:
+              type: string
+              format: date
+              description: |
+                Date the pharmacy or hospital dispensed medications. Defaults to today if omitted.
+                Must satisfy: `admissionDate ≤ dispensingDate ≤ admissionDate + 30 days`.
+            isAllPrescriptionsServed:
+              type: boolean
+              default: true
+              description: |
+                Set to `false` when this call records only a partial dispense and further
+                prescription lines will be added in subsequent calls against the same voucherNumber.
+                When `true` (default), the visit is closed after saving.
+          description: |
+            RAMA visit. The beneficiary is identified by the single `memberId` field on the
+            base schema; `voucherNumber` is always required.
+    PatientVisitResponse:
+      type: object
+      properties:
+        visitReference: { type: string, description: "Stable partner-facing reference. CBHI: VST-C-{id}; RAMA: VST-R-{id}." }
+        status: { $ref: '#/components/schemas/PatientVisitStatus' }
+        totalAmount: { type: number }
+        currency: { type: string }
+        services:
+          type: array
+          description: |
+            Echoed service lines, enriched by the gateway with `type` (the catalogue kind:
+            `MEDICAL_ACT`, `LAB_EXAM`, `IMAGING`, `DRUG`, `CONSUMABLE`), the resolved
+            `unitPrice` (RWF), and the computed `amount` (RWF). For drug lines
+            `amount = unitPrice × durationDays`; for all other lines
+            `amount = unitPrice × quantity`.
+          items:
+            $ref: '#/components/schemas/VisitServiceResponseItem'
+        requireMedicalAdvisorApproval:
+          type: boolean
+          description: |
+            **RAMA only.** `true` when one or more submitted products require medical-advisor
+            review before dispensing (e.g. restricted drugs, high-cost imaging, surgery). The visit
+            enters `PENDING_MEDICAL_ADVISOR_REVIEW` status. Absent or `false` for CBHI visits and
+            for RAMA visits where every line is auto-approvable.
+        pendingApprovalItems:
+          type: array
+          description: |
+            **RAMA only.** Present (and non-empty) when `requireMedicalAdvisorApproval=true`.
+            Lists every submitted line the gateway flagged as pre-auth-required so the caller
+            can display "pending approval" status per item instead of holding the whole visit in
+            an opaque "pending" state. Each entry points to a specific line in `services[]` by
+            its submitted `code` (no separate `kind` field is needed — the merged `services[]`
+            has unique codes).
+          items:
+            type: object
+            required: [code, status, reason]
+            properties:
+              code:
+                type: string
+                description: The product code submitted on the line (echoed verbatim).
+              status:
+                type: string
+                enum: [PENDING_MEDICAL_ADVISOR_APPROVAL]
+                description: Lifecycle state for this specific line. Initially always `PENDING_MEDICAL_ADVISOR_APPROVAL`.
+              reason:
+                type: string
+                example: REQUIRES_PRE_AUTHORIZATION
+                description: Why the line was flagged — e.g. `REQUIRES_PRE_AUTHORIZATION`, `QUANTITY_ABOVE_AUTO_APPROVAL_THRESHOLD`, `OUT_OF_FORMULARY_SUBSTITUTION`.
+              preAuthReference:
+                type: string
+                nullable: true
+                description: |
+                  If the gateway auto-opened a pre-authorization record for this line (no existing
+                  `preAuthReference` was supplied on the visit), this is the reference — the caller
+                  can poll `/pre-authorizations/{ref}` or subscribe to `rama.preauth.decided`.
+              message:
+                type: string
+                description: Human-readable hint for the UI, e.g. "MRI requires medical-advisor approval before the study is performed."
+
+    VisitServiceResponseItem:
+      type: object
+      required: [code, quantity, type, unitPrice, amount]
+      description: |
+        A single line echoed on a visit response. Always includes the resolved catalogue
+        `type`, `unitPrice` (RWF), and computed `amount` (RWF). Drug lines also echo the
+        clinical fields the caller supplied.
+      properties:
+        code: { type: string, description: Product code submitted on the request (echoed verbatim). }
+        quantity: { type: integer }
+        type:
+          type: string
+          enum: [MEDICAL_ACT, LAB_EXAM, IMAGING, DRUG, CONSUMABLE]
+          description: Catalogue kind resolved from the product code.
+        unitPrice:
+          type: integer
+          description: Unit price in RWF at the scheme's tariff (integer — RWF has no subunit).
+        amount:
+          type: integer
+          description: |
+            Total line amount in RWF.
+            - Drug lines — `unitPrice × durationDays`.
+            - All other lines — `unitPrice × quantity`.
+        frequency:
+          $ref: '#/components/schemas/DrugAdministrationFrequency'
+          description: Drug lines only. Echoed verbatim.
+        customHours:
+          type: array
+          description: Drug lines only. Echoed verbatim when frequency=CUSTOM_HOURS.
+          items: { type: string }
+        durationDays: { type: integer, description: Drug lines only. }
+        posology: { type: string, description: Drug lines only. }
+        status:
+          type: string
+          description: |
+            Per-line status when the gateway held this line for review — e.g.
+            `PENDING_MEDICAL_ADVISOR_APPROVAL`. Absent for auto-approved lines.
+
+    PatientVisit:
+      allOf:
+        - $ref: '#/components/schemas/PatientVisitResponse'
+        - type: object
+          properties:
+            scheme: { $ref: '#/components/schemas/Scheme' }
+            fosaId: { type: string }
+            practitionerLicenseNumber: { type: string }
+            memberId:
+              type: string
+              description: |
+                The patient identifier supplied on the request (CBHI or RAMA). Echoes the
+                partner-provided value; the gateway does not rewrite it.
+            healthCareStayType: { type: string, enum: [OUT_PATIENT, IN_PATIENT] }
+            admissionDate: { type: string, format: date }
+            dispensingDate:
+              type: string
+              format: date
+              nullable: true
+              description: RAMA only. Date medications were dispensed.
+            dischargeDate: { type: string, format: date, nullable: true }
+            diagnosisCodes: { type: array, items: { type: string } }
+            prescriptionDestination:
+              type: string
+              enum: [FACILITY_DISPENSE, PHARMACY]
+              description: Echoed from the request (default `FACILITY_DISPENSE`). `PHARMACY` is RAMA-only.
+            voucherNumber:
+              type: string
+              nullable: true
+              description: RAMA only. The paper voucher code used when the visit was recorded.
+            prescribingFosaId:
+              type: string
+              nullable: true
+              description: Populated when a pharmacy EMR recorded dispensing against a paper prescription.
+            prescribingPractitionerLicenseNumber:
+              type: string
+              nullable: true
+              description: Populated when a pharmacy EMR recorded dispensing against a paper prescription.
+            submittedBy: { type: string }
+            createdAt: { type: string, format: date-time }
+    OpenVoucherRequest:
+      type: object
+      required: [memberId]
+      properties:
+        fosaId:
+          type: string
+          description: |
+            Any unique code identifying the pharmacy opening the voucher. Only required for
+            MOH E-Ubuzima; pharmacy EMR credentials are single-facility-scoped and the gateway
+            infers `fosaId` from the session.
+        memberId:
+          type: string
+          description: |
+            Any unique identifier the partner holds for the RAMA beneficiary — `beneficiaryNumber`,
+            `mainCardNumber`, `nationalId`, or `passportNumber`. Also accepted under the alias
+            `patientId`.
+        patientId: { type: string, description: Alias for `memberId`. }
+        treatmentDate:
+          type: string
+          format: date
+          description: Date of treatment. Defaults to today if omitted.
+        visitReference: { type: string, description: "Optional link to a recorded hospital visit (VST-R-…). Used when a pharmacy is dispensing for a hospital-initiated visit rather than a standalone walk-in." }
+    Voucher:
+      type: object
+      properties:
+        voucherReference: { type: string }
+        scheme: { type: string, enum: [RAMA] }
+        fosaId: { type: string }
+        beneficiaryNumber: { type: string }
+        patientName: { type: string }
+        status: { type: string, enum: [OPEN, DISPENSED, EXPIRED, CANCELLED] }
+        openedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+        dispensedAt: { type: string, format: date-time, nullable: true }
+        items: { type: array, items: { type: object, additionalProperties: true } }
+        totalAmount: { type: number }
+    DispenseRequest:
+      type: object
+      required: [voucherReference, items]
+      properties:
+        voucherReference: { type: string }
+        items:
+          type: array
+          items:
+            type: object
+            required: [productCode, quantity]
+            properties:
+              productCode: { type: string }
+              quantity: { type: integer }
+              durationDays: { type: integer }
+    DispenseResponse:
+      type: object
+      properties:
+        voucherReference: { type: string }
+        status: { type: string }
+        totalAmount: { type: number }
+        currency: { type: string }
+        items: { type: array, items: { type: object, additionalProperties: true } }
+    SupportingDocument:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [BIRTH_CERTIFICATE, DISABILITY_CERTIFICATE, STUDENT_CARD, PHYSIOTHERAPY_ORDONNANCE, REFERRAL_LETTER, DISCHARGE_SUMMARY, OTHER]
+        url: { type: string, description: Public URL the backend can retrieve the document from. }
+        base64: { type: string, description: Inline base64-encoded document content (for small files). }
+        filename: { type: string }
+        mimeType: { type: string }
+
+    PatientVisitStatus:
+      type: string
+      description: |
+        Lifecycle status of a patient visit. Values are scheme-specific:
+
+        **Shared (CBHI + RAMA)**
+        - `SUBMITTED` — recorded by the partner, not yet reviewed.
+        - `UNDER_REVIEW` — claims verifier is reviewing.
+        - `APPROVED` — approved for payment.
+        - `REJECTED` — rejected; partner may resubmit via `POST /patient-visits/{ref}/resubmit`.
+        - `RESUBMITTED` — previously rejected, now resubmitted for re-adjudication.
+        - `HQ_APPROVED` — approved at headquarters level (second-level approval).
+        - `PAID` — payment has been disbursed.
+        - `CANCELLED` — visit cancelled before approval.
+
+        **RAMA-specific**
+        - `AWAITING_HOSPITAL_DISPENSING` — hospital recorded the visit with prescriptions; the
+          in-house pharmacy has not yet dispensed. Applies when `prescriptionDestination:
+          FACILITY_DISPENSE` was used.
+        - `PATIENT_AWAITING_DISCHARGE` — in-patient is admitted; `dischargeDate` has not been set.
+          The visit will remain in this status until `POST /patient-visits/{ref}/discharge` is called
+          or the end-of-month auto-discharge runs.
+        - `PATIENT_DISCHARGED` — in-patient has been formally discharged (manually or via auto-discharge).
+        - `PENDING_MEDICAL_ADVISOR_REVIEW` — one or more prescriptions flagged for medical-advisor
+          review (`requiresPreAuthorization: true`). Prescriptions enter
+          `PENDING_MEDICAL_ADVISOR_APPROVAL` status until an advisor acts.
+      enum:
+        - SUBMITTED
+        - UNDER_REVIEW
+        - APPROVED
+        - REJECTED
+        - RESUBMITTED
+        - HQ_APPROVED
+        - PAID
+        - CANCELLED
+        - AWAITING_HOSPITAL_DISPENSING
+        - PATIENT_AWAITING_DISCHARGE
+        - PATIENT_DISCHARGED
+        - PENDING_MEDICAL_ADVISOR_REVIEW
+
+    StatusHistoryEntry:
+      type: object
+      properties:
+        code:
+          $ref: '#/components/schemas/PatientVisitStatus'
+        actor:
+          type: string
+          description: Service name or internal role that triggered the change.
+        reasonCode: { type: string }
+        comment: { type: string }
+        occurredAt: { type: string, format: date-time }
+
+    ResubmitRequest:
+      type: object
+      required: [reasonForResubmission]
+      properties:
+        reasonForResubmission: { type: string }
+        diagnosisCodes: { type: array, items: { type: string } }
+        prescriptionDestination:
+          type: string
+          enum: [FACILITY_DISPENSE, PHARMACY]
+          description: Optional — override the routing for prescribed drugs/consumables on the resubmitted visit.
+        services:
+          type: array
+          description: |
+            Corrected service lines. Same shape as `PatientVisitRequestBase.services` —
+            one flat list containing medical acts, lab/imaging, consumables, and drugs
+            (drugs carry the optional `frequency` / `customHours[]` / `durationDays` /
+            `posology` fields).
+          items:
+            type: object
+            required: [code, quantity]
+            properties:
+              code: { type: string }
+              quantity: { type: integer }
+              frequency:
+                $ref: '#/components/schemas/DrugAdministrationFrequency'
+              customHours:
+                type: array
+                items: { type: string }
+              durationDays: { type: integer }
+              posology: { type: string }
+        supportingDocuments:
+          type: array
+          items: { $ref: '#/components/schemas/SupportingDocument' }
+
+    DischargeRequest:
+      type: object
+      required: [dischargeDate]
+      properties:
+        dischargeDate: { type: string, format: date }
+        daysStayed:
+          type: integer
+          description: If omitted, computed from admission → discharge.
+        dischargeSummaryUrl: { type: string }
+
+    TransferRequest:
+      type: object
+      required: [destinationFosaId]
+      properties:
+        destinationFosaId: { type: string }
+        motivation: { type: string }
+        lines:
+          type: array
+          description: |
+            For pharmacy-destination transfers (RAMA), the drug/consumable lines to move.
+            Each `productCode` must reference an existing outstanding prescription on the visit
+            with sufficient remaining quantity. The `quantity` must not exceed the prescription's
+            remaining quantity. Omit for a full-visit referral (CBHI or RAMA facility-to-facility).
+          items:
+            type: object
+            required: [productCode, quantity]
+            properties:
+              productCode: { type: string }
+              quantity: { type: integer }
+
+    Transfer:
+      type: object
+      properties:
+        transferReference: { type: string }
+        scheme: { $ref: '#/components/schemas/Scheme' }
+        sourceVisitReference: { type: string }
+        sourceFosaId: { type: string }
+        destinationFosaId: { type: string }
+        destinationType:
+          type: string
+          description: Facility type of the destination (e.g. PHARMACY, DISTRICT_HOSPITAL).
+        memberKey: { type: string }
+        motivation: { type: string }
+        lines:
+          type: array
+          items:
+            type: object
+            properties:
+              productCode: { type: string }
+              quantity: { type: integer }
+              prescriptionReference: { type: string }
+        status: { type: string, enum: [PENDING_ACCEPTANCE, ACCEPTED, CANCELLED] }
+        createdAt: { type: string, format: date-time }
+        acceptedAt: { type: string, format: date-time }
+        voucherReference:
+          type: string
+          description: Set when a pharmacy acceptance produced a dispensed voucher.
+
+    PharmacyPrescription:
+      type: object
+      description: |
+        A RAMA e-prescription. Written by a hospital during a patient visit and visible
+        system-wide — **any RAMA-contracted pharmacy** can list and fulfil it by
+        `memberId`. The Rx is not tied to a specific pharmacy.
+      properties:
+        prescriptionReference: { type: string }
+        visitReference: { type: string }
+        prescribingFosaId:
+          type: string
+          description: Facility that wrote the prescription.
+        prescribingPractitioner:
+          type: string
+          description: Licence number of the prescribing practitioner.
+        memberId:
+          type: string
+          description: RAMA beneficiary identifier the prescription was written against.
+        productCode: { type: string }
+        productName: { type: string }
+        quantityPrescribed: { type: integer }
+        quantityRemaining: { type: integer }
+        unitPrice: { type: number }
+        dosage:
+          type: string
+          description: Strength per administration (e.g. "500mg", "10ml").
+        posology:
+          type: string
+          description: Free-text dosing regimen for the patient.
+        frequency:
+          $ref: '#/components/schemas/DrugAdministrationFrequency'
+        customHours:
+          type: array
+          description: Populated when `frequency=CUSTOM_HOURS`.
+          items: { type: string }
+        route:
+          $ref: '#/components/schemas/AdministrationRoute'
+        durationDays: { type: integer }
+        instructions: { type: string }
+        allowSubstitution: { type: boolean }
+        substitutableWith:
+          type: array
+          items: { type: string }
+        refillsAllowed: { type: integer }
+        refillsRemaining: { type: integer }
+        prescribedAt: { type: string, format: date }
+        validityDays: { type: integer }
+        expiresAt:
+          type: string
+          format: date-time
+          description: After this point the Rx can no longer be filled.
+        status:
+          $ref: '#/components/schemas/PrescriptionStatus'
+
+    DrugAdministrationFrequency:
+      type: string
+      description: |
+        Backend-aligned frequency codes. All values below follow standard medical abbreviations.
+        Use `CUSTOM_HOURS` when no standard code fits — then populate `customHours[]` with the exact clock times.
+      enum:
+        - QD           # once daily
+        - BID          # twice daily
+        - TID          # three times daily
+        - QID          # four times daily
+        - QHS          # at bedtime
+        - FIVE_TIMES_A_DAY
+        - Q4H          # every 4 hours
+        - Q6H          # every 6 hours
+        - QOD          # every other day
+        - PRN          # as needed
+        - ONCE_A_WEEK
+        - CUSTOM_HOURS
+
+    AdministrationRoute:
+      type: string
+      description: Route of administration.
+      enum:
+        - ORAL
+        - SUBLINGUAL
+        - BUCCAL
+        - TOPICAL
+        - TRANSDERMAL
+        - INHALED
+        - NEBULISED
+        - INTRAVENOUS
+        - INTRAMUSCULAR
+        - SUBCUTANEOUS
+        - INTRADERMAL
+        - RECTAL
+        - VAGINAL
+        - OPHTHALMIC
+        - OTIC
+        - NASAL
+
+    PrescriptionStatus:
+      type: string
+      description: |
+        Backend-aligned prescription lifecycle. Partner-visible statuses:
+
+        - `IN_PROCESS` — draft, not yet submitted for dispensing.
+        - `PENDING_HOSPITAL_DISPENSING` — intended to be dispensed by the prescribing hospital's in-house pharmacy.
+        - `PENDING_PHARMACY_DISPENSING` — system-wide e-prescription any RAMA pharmacy can fill.
+        - `PENDING_MEDICAL_ADVISOR_APPROVAL` — held for medical-advisor review (restricted products).
+        - `MEDICAL_ADVISOR_APPROVED` / `MEDICAL_ADVISOR_APPROVED_WITH_ADJUSTMENT` — cleared for dispensing.
+        - `MEDICAL_ADVISOR_REJECTED` — will not be filled; hospital must rewrite.
+        - `PENDING_ADJUSTMENT` — awaiting hospital-side correction.
+        - `PARTIALLY_DISPENSED` — some quantity dispensed; remainder still fillable.
+        - `DISPENSED` — fully filled.
+        - `EXPIRED` — `expiresAt` passed.
+        - `CANCELLED` — prescribing clinician cancelled.
+      enum:
+        - IN_PROCESS
+        - PENDING_HOSPITAL_DISPENSING
+        - PENDING_PHARMACY_DISPENSING
+        - PENDING_MEDICAL_ADVISOR_APPROVAL
+        - MEDICAL_ADVISOR_APPROVED
+        - MEDICAL_ADVISOR_APPROVED_WITH_ADJUSTMENT
+        - MEDICAL_ADVISOR_REJECTED
+        - PENDING_ADJUSTMENT
+        - PARTIALLY_DISPENSED
+        - DISPENSED
+        - EXPIRED
+        - CANCELLED
+
+    PatientVisitType:
+      type: string
+      description: |
+        Which kind of visit this is. The gateway auto-sets this based on the caller's facility type
+        (pharmacy credential → `PHARMACY_VISIT`, hospital credential → `FACILITY_MAIN_VISIT`).
+        Partners may override to record `FACILITY_FOLLOW_UP` (same beneficiary returning within a
+        defined window) or `TRANSFER_VISIT` (continuing care received at another facility).
+      enum:
+        - FACILITY_MAIN_VISIT
+        - FACILITY_FOLLOW_UP
+        - PHARMACY_VISIT
+        - TRANSFER_VISIT
+
+    FulfilPrescriptionRequest:
+      type: object
+      required: [quantity]
+      properties:
+        fosaId:
+          type: string
+          description: |
+            Any unique code identifying the dispensing pharmacy. Must be a facility of type
+            PHARMACY. Only required for MOH E-Ubuzima; inferred from the session for
+            pharmacy EMR credentials.
+        quantity: { type: integer, description: Quantity dispensed in this call (≤ quantityRemaining). }
+        durationDays: { type: integer }
+
+    PreAuthorizationRequest:
+      type: object
+      required: [practitionerLicenseNumber, memberId, products, clinicalKnowledge]
+      properties:
+        fosaId:
+          type: string
+          description: |
+            Any unique code identifying the requesting facility. Only required for
+            MOH E-Ubuzima; inferred from the session for hospital or pharmacy EMR credentials.
+        practitionerLicenseNumber: { type: string }
+        memberId:
+          type: string
+          description: |
+            Any unique identifier for the RAMA beneficiary — `beneficiaryNumber`,
+            `mainCardNumber`, `nationalId`, or `passportNumber`. Also accepted under
+            the alias `patientId`.
+        patientId: { type: string, description: Alias for `memberId`. }
+        diagnosisCodes: { type: array, items: { type: string } }
+        products:
+          type: array
+          items:
+            type: object
+            required: [productCode]
+            properties:
+              productCode: { type: string }
+              quantity: { type: integer }
+        clinicalKnowledge:
+          type: string
+          description: |
+            Plain-text clinical message for the medical advisor. **Required** — every
+            pre-authorization must carry a single narrative field with prior history,
+            examination findings, test results, and any justification tying the requested
+            products to the clinical picture. Visit submissions with pre-auth-gated products
+            on `POST /patient-visits` should echo the same field so the two flows share one
+            narrative.
+          example: "55yo female with suspected metastatic disease. Requesting CT to stage before oncology referral. No prior imaging in the last 12 months."
+        supportingDocuments:
+          type: array
+          items: { $ref: '#/components/schemas/SupportingDocument' }
+
+    PreAuthorization:
+      type: object
+      properties:
+        preauthReference: { type: string }
+        scheme: { type: string, enum: [RAMA] }
+        fosaId: { type: string }
+        memberId: { type: string }
+        products: { type: array, items: { type: object, additionalProperties: true } }
+        outcome: { $ref: '#/components/schemas/PreAuthorizationOutcome' }
+        conditions: { type: array, items: { type: string }, description: Conditions attached when outcome is APPROVED_WITH_CONDITIONS. }
+        decidedBy:
+          type: string
+          description: Medical-advisor role that issued the decision.
+        decidedAt: { type: string, format: date-time }
+        submittedAt: { type: string, format: date-time }
+        expiresAt: { type: string, format: date-time }
+
+    PreAuthorizationOutcome:
+      type: string
+      enum: [APPROVED, APPROVED_WITH_CONDITIONS, CONDITIONAL_MORE_INFO, REJECTED, ADJUSTED, UNDER_REVIEW, ESCALATED]
+
+    ReasonCode:
+      type: object
+      properties:
+        code: { type: string }
+        domain: { type: string, enum: [rejection, preauth] }
+        label: { type: string }
+        description: { type: string }
+        requiresComment: { type: boolean }
+
+    WebhookEvent:
+      type: string
+      description: |
+        Event names a webhook subscription can listen to. Stable v1.2 catalogue.
+      enum:
+        - cbhi.patient-visit.created
+        - cbhi.patient-visit.status-changed
+        - rama.patient-visit.created
+        - rama.patient-visit.status-changed
+        - rama.voucher.dispensed
+        - rama.preauth.decided
+
+    WebhookSubscriptionRequest:
+      type: object
+      required: [targetUrl, events]
+      properties:
+        targetUrl: { type: string, format: uri, description: HTTPS endpoint the gateway will POST signed event payloads to. }
+        events:
+          type: array
+          items: { $ref: '#/components/schemas/WebhookEvent' }
+          description: Event names from GET /webhooks/events.
+        description: { type: string }
+
+    WebhookSubscription:
+      type: object
+      properties:
+        id: { type: string }
+        targetUrl: { type: string, format: uri }
+        events: { type: array, items: { $ref: '#/components/schemas/WebhookEvent' } }
+        secret: { type: string, description: HMAC-SHA256 key. Returned only on create. Store it — the gateway does not expose it again. }
+        description: { type: string }
+        active: { type: boolean }
+        createdAt: { type: string, format: date-time }
+
+    WebhookDelivery:
+      type: object
+      properties:
+        deliveryReference: { type: string }
+        subscriptionId: { type: string }
+        event: { $ref: '#/components/schemas/WebhookEvent' }
+        payload: { type: object, additionalProperties: true }
+        signature:
+          type: string
+          description: HMAC-SHA256 signature over the raw body, base64-encoded.
+        status: { type: string, enum: [PENDING, DELIVERED, FAILED] }
+        attempt: { type: integer }
+        lastAttemptAt: { type: string, format: date-time }
+        nextRetryAt: { type: string, format: date-time }
+        createdAt: { type: string, format: date-time }

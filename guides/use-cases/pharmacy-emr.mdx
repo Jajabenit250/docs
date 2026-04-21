@@ -1,0 +1,114 @@
+---
+title: "Pharmacy EMR walkthrough"
+description: "Private pharmacies dispensing against RAMA — fulfil hospital e-prescriptions or register external paper prescriptions; CBHI is never dispensed at private pharmacies."
+---
+
+Private pharmacies dispensing against RAMA. Two flows: fulfil a hospital e-prescription, or register an external paper prescription. Pharmacies never create patient visits — they only dispense. The `fosaId` is inferred from the session — you never have to repeat it on clinical calls. CBHI is never dispensed at private pharmacies.
+
+<Note>**Mental model** — Hospital-written RAMA prescriptions with `prescriptionDestination=PHARMACY` live on the beneficiary's record and any RAMA-contracted pharmacy can pull them up. There is no "inbound transfer" step. Query by `memberId`, dispense, done. _**Time:** ~45 min · **Scope:** `RAMA` only, single pharmacy `fosaId` (session-bound), `allowPharmacy:true`_</Note>
+
+<Warning>
+  **CBHI is hard-rejected on pharmacy endpoints.** `scheme:"CBHI"` on any `/pharmacy/*` call or pharmacy visit returns `PHARMACY_DISPENSE_NOT_ALLOWED_FOR_CBHI`. CBHI members pay cash at private pharmacies.
+</Warning>
+
+## Flow A — Fulfil a hospital e-prescription
+
+<Steps>
+  <Step title="Authenticate">
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/session \
+      -H 'Content-Type: application/json' \
+      -d '{"serviceName":"conseil-pharmacy","serviceSecret":"demo-pharmacy-secret"}'
+    ```
+  </Step>
+  <Step title="Scan card → look up pending e-prescriptions">
+    Returns every prescription in `PENDING_PHARMACY_DISPENSING` or `PARTIALLY_DISPENSED` for this beneficiary across all prescribing hospitals. Each entry carries the compact clinical shape (`code`, `frequency`, `durationDays`, `posology`) plus advisor status and remaining quantity.
+
+    ```bash
+    curl "http://localhost:4010/api/v1/partner/pharmacy/prescriptions?memberId=RAMA-00045678" \
+      -H "Authorization: Bearer $TOKEN"
+    ```
+
+    Prescription status values:
+
+    | Status | When |
+    | --- | --- |
+    | `PENDING_PHARMACY_DISPENSING` | Hospital visit was posted with `prescriptionDestination=PHARMACY`. Available for any RAMA pharmacy. |
+    | `PENDING_HOSPITAL_DISPENSING` | `prescriptionDestination=FACILITY_DISPENSE`. Not your fill. |
+    | `PENDING_MEDICAL_ADVISOR_APPROVAL` | Triggered a pre-auth review. |
+    | `MEDICAL_ADVISOR_APPROVED` / `…_WITH_ADJUSTMENT` | Pre-auth cleared. |
+    | `MEDICAL_ADVISOR_REJECTED` | Pre-auth denied — do not dispense. |
+    | `PARTIALLY_DISPENSED` | Some quantity filled; remainder still collectable. |
+    | `DISPENSED` / `EXPIRED` / `CANCELLED` | Terminal — cannot fulfil. |
+  </Step>
+  <Step title="Fulfil (full or partial)">
+    The gateway mints a `DISPENSED` voucher in one call and marks the Rx `DISPENSED` (or `PARTIALLY_DISPENSED`). A `rama.voucher.dispensed` webhook fires. `fosaId` is session-inferred.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/pharmacy/prescriptions/RX-20260420-0001/fulfil \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{ "quantity": 30 }'
+    ```
+  </Step>
+</Steps>
+
+## Flow B — Register a paper prescription from outside Kwivuza
+
+A patient arrives with a handwritten or external-system prescription — a referral from a non-integrated clinic, a walk-in with an OTC need, a returning patient from abroad. Pharmacies never create patient visits; they only dispense. Register the paper Rx against the **prescribing facility**, then fulfil it like any other e-Rx.
+
+<Info>
+  **Pharmacies dispense drugs and consumables only.** On every pharmacy call (Flow A fulfil, Flow B paper-Rx), `services[]` / `drugs[]` / `consumables[]` may contain only products of type `DRUG` or `CONSUMABLE`. Any medical act, lab, or imaging code returns `PRODUCT_TYPE_NOT_ALLOWED_FOR_PHARMACY`.
+</Info>
+
+<Steps>
+  <Step title="Post the paper prescription">
+    Identify only the `prescribingFacility` — any unique facility code the pharmacist can read off the paper (`fosaId`, matricule, TIN, or name). Drugs and consumables share a single `services[]` array — the product catalog tells the gateway which is which.
+
+    ```bash
+    curl -X POST http://localhost:4010/api/v1/partner/pharmacy/paper-prescriptions \
+      -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+      -d '{
+        "scheme": "RAMA",
+        "memberId": "RAMA-00045678",
+        "prescribingFacility": "30311017",
+        "prescriptionDate": "2026-04-18",
+        "services": [
+          {
+            "code": "C09AA05",
+            "frequency": "QD",
+            "durationDays": 30,
+            "posology": "1 tablet in the morning"
+          },
+          { "code": "CONS-SYR-5ML", "quantity": 1 }
+        ]
+      }'
+    ```
+
+    Full field reference and resolver rules: [paper-prescription guide](/guides/use-cases/paper-prescription).
+  </Step>
+  <Step title="Dispense">
+    The response carries a `prescriptionReference` with status `PENDING_PHARMACY_DISPENSING`. Fulfil with the same `/pharmacy/prescriptions/{ref}/fulfil` endpoint as Flow A.
+  </Step>
+</Steps>
+
+## Paper-prescription fields
+
+| Field | Required | Notes |
+| --- | --- | --- |
+| `scheme` | ✓ | Must be `RAMA`. |
+| `memberId` | ✓ | Any RAMA key: `beneficiaryNumber`, `mainCardNumber`, `nationalId`, `passportNumber`. |
+| `prescribingFacility` | ✓ | Any unique facility code on the paper: `fosaId`, matricule, TIN, or facility name. |
+| `prescriptionDate` | ✓ | Date on the paper. Must be within 30 days. |
+| `services[]` | ✓ | At least one line. Only `DRUG` and `CONSUMABLE` products are accepted — anything else returns `PRODUCT_TYPE_NOT_ALLOWED_FOR_PHARMACY`. |
+
+## Voucher-lifecycle errors
+
+| code | When |
+| --- | --- |
+| `PRESCRIPTION_NOT_PENDING` | Rx already dispensed, cancelled, expired, or in advisor review. |
+| `QUANTITY_EXCEEDS_REMAINING` | Requested quantity > `quantityRemaining`. |
+| `MEMBER_NOT_RESOLVED` | `memberId` didn't match any RAMA key. |
+| `BENEFICIARY_NOT_ELIGIBLE` | Card became inactive between prescribe and dispense. |
+| `PRESCRIBING_FACILITY_NOT_RESOLVED` | Paper-Rx resolver couldn't find the prescribing facility by the supplied code. |
+| `PRESCRIBING_PRACTITIONER_NOT_RESOLVED` | Same, for the prescriber. |
+| `INVALID_FREQUENCY` / `CUSTOM_HOURS_REQUIRED` | Drug line carries an off-enum value, or `CUSTOM_HOURS` without `customHours[]`. |

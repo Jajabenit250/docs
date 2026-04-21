@@ -1,0 +1,51 @@
+---
+title: "Environments"
+description: "Four environments cover the integration lifecycle: a local mock for offline development, a shared sandbox for partner testing, staging for dry-runs against production-shaped data, and production itself."
+---
+
+<Note>**What you'll learn** — Which base URL to target, where credentials come from, and how the data differs between tiers. Nothing to run here — this is the cheat sheet you bookmark and come back to.</Note>
+
+## At a glance
+
+| Environment | Base URL | Credentials | Data |
+| --- | --- | --- | --- |
+| **Local mock** | `http://localhost:4010` | Checked-in demo secrets | Seed JSON in `mock/db/*.json` |
+| **Sandbox** | `https://sandbox.gateway.kwivuza.rw` | Per-partner via partner manager | Synthetic, reset nightly |
+| **Staging** | `https://staging.gateway.kwivuza.rw` | Staging secrets | Production-shaped snapshot |
+| **Production** | `https://gateway.kwivuza.rw` | Production secrets | Live patients, live money |
+
+## Local mock
+
+The repo includes a full Express mock under `docs/partner-api/mock/` that enforces JWT auth, scheme scoping, facility scoping, and voucher lifecycle rules — it's the real gateway's contract, just with seed data.
+
+<Steps>
+  <Step title="Start the mock">
+    From the repo root, install deps then run the dev server. The Try-it console defaults to this URL.
+
+    ```bash
+    cd docs/partner-api/mock
+    npm install
+    npm run dev
+    # → listening on http://localhost:4010
+    ```
+  </Step>
+
+  <Step title="Point the Try-it console at it">
+    Open the Try it console and confirm the *Mock server* field reads `http://localhost:4010`. Sign in with a demo credential and run any operation.
+  </Step>
+
+  <Step title="Reset seed data">
+    The mock writes back to `mock/db/*.json`. To get a clean slate, `git checkout mock/db/`.
+  </Step>
+</Steps>
+
+## Promotion checklist — before you ship to production
+
+- **No hard-coded base URLs.** Read from config; don't let `localhost:4010` slip into a release.
+- **Secrets in a secret manager** (AWS Secrets Manager, Vault, GCP Secret Manager). Never in source, never in CI logs.
+- **Retry 5xx** with exponential backoff (1s → 2s → 4s, cap at 3 attempts). Never retry 4xx except `TOKEN_EXPIRED` (after refreshing).
+- **Log `error.code`**, not just HTTP status — codes are stable, messages may change.
+- **Dry-run in staging** with a production-shaped snapshot before your first live request.
+- **Webhook URLs** must terminate TLS and verify the `X-Kwivuza-Signature` header.
+
+<Warning>**Sandbox is shared.** Don't seed large volumes or test destructive flows that might collide with other partners. Staging is for that — request access via your partner manager.</Warning>

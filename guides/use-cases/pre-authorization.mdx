@@ -1,0 +1,81 @@
+---
+title: "Pre-authorization & clinicalKnowledge"
+description: "Expensive RAMA services require a medical-advisor decision before care. The /pre-authorizations endpoint carries the requested products and a clinicalKnowledge narrative the advisor reads to approve, adjust, or reject."
+---
+
+<Note>**What the advisor sees** — `clinicalKnowledge` is a required plain-text string — one or two paragraphs describing the chief complaint, findings, prior treatments, and justification. Write it the way you'd write a short clinical note to a colleague.</Note>
+
+## Request shape
+
+```json
+POST /api/v1/partner/pre-authorizations
+{
+  "fosaId": "30311017",                    // MOH only; inferred for hospital/pharmacy sessions
+  "practitionerLicenseNumber": "RMDC-23456",
+  "memberId": "RAMA-00045678",
+  "diagnosisCodes": ["BA00"],
+  "products": [
+    { "code": "SRV-MRI", "quantity": 1 }
+  ],
+  "clinicalKnowledge": "45F with 3-week progressive right-sided headache, episodic vomiting and reduced grip strength. Exam: R-sided weakness, Babinski positive. Prior Paracetamol and NSAIDs ineffective. CT inconclusive. MRI requested to rule out intracranial mass before surgical planning. Urgency: URGENT."
+}
+```
+
+## The `clinicalKnowledge` field
+
+`clinicalKnowledge` (string, required): plain-text clinical narrative for the advisor — chief complaint, findings, prior treatments, justification, urgency.
+
+## Decision lifecycle
+
+<Steps>
+  <Step title="Submit">
+    Response returns `preAuthReference` and `status: "PENDING_MEDICAL_ADVISOR_APPROVAL"`. Do not proceed with the procedure.
+  </Step>
+  <Step title="Advisor reviews">
+    Decision happens out-of-band. Target SLAs: ROUTINE 48h, URGENT 4h, EMERGENCY 30 min.
+  </Step>
+  <Step title="Webhook fires — rama.preauth.decided">
+    Payload carries the decision + (if adjusted) a modified product list. Decision values:
+
+    | Decision | Meaning |
+    | --- | --- |
+    | `APPROVED` | Proceed. Reference usable on the next `/patient-visits` call. |
+    | `APPROVED_WITH_ADJUSTMENT` | Proceed with the advisor-adjusted `approvedProducts[]`. Your claim must match. |
+    | `REJECTED` | Do not proceed. Reason in `rejectionReasonCode` + `comment`. |
+    | `ADDITIONAL_INFO_REQUESTED` | Submit an amendment on the same reference with missing fields. |
+  </Step>
+  <Step title="Link on the visit">
+    Post `/patient-visits` with `preAuthReference`. The gateway validates products match and attaches the approval for HQ.
+  </Step>
+</Steps>
+
+## Visit-side enforcement — auto-open on submission
+
+A visit submitted without a `preAuthReference` that contains pre-auth-required items is **not** hard-rejected. The gateway accepts the visit, marks it `PENDING_MEDICAL_ADVISOR_REVIEW`, and returns a `pendingApprovalItems[]` array listing each flagged line with an auto-opened `preAuthReference` you can track:
+
+```json
+{
+  "visitReference": "VST-R-20260420-0041",
+  "status": "PENDING_MEDICAL_ADVISOR_REVIEW",
+  "requireMedicalAdvisorApproval": true,
+  "pendingApprovalItems": [
+    {
+      "code": "SRV-MRI",
+      "status": "PENDING_MEDICAL_ADVISOR_APPROVAL",
+      "reason": "REQUIRES_PRE_AUTHORIZATION",
+      "preAuthReference": "PA-20260420-0013",
+      "message": "MRI requires medical-advisor approval before the study is performed."
+    }
+  ]
+}
+```
+
+Display each entry as a per-item "pending approval" state in your UI. Lines that are *not* in `pendingApprovalItems[]` are auto-approved and dispensable immediately. When the advisor webhook fires for an auto-opened `preAuthReference`, update only that line — the rest of the visit already moved.
+
+- **Supplying a reference upfront still works.** If you obtained approval via `/pre-authorizations` first, pass `preAuthReference` on the visit; those lines are not flagged.
+- **Expired references.** Approvals expire after 30 days by default. Expired refs return `PRE_AUTH_EXPIRED`.
+- **Partial match.** If the visit contains products not on the approved list, the non-approved lines auto-open a new pre-auth (appearing in `pendingApprovalItems[]`); the approved lines pass.
+
+## Which products trigger pre-auth?
+
+Query `GET /products?requiresPreAuthorization=true&scheme=RAMA` for the live list. Common families: SRV-MRI, SRV-CT, SRV-DIALYSIS, SRV-SURGERY-*, oncology (ATC L01).
